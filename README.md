@@ -1,6 +1,6 @@
 # AutoRSS — Automated RSS-to-Social Publishing Pipeline
 
-A lightweight, serverless Node.js automation script that runs on a scheduled GitHub Actions workflow. It fetches RSS feed content, scores it with Google Gemini AI, publishes the top-scoring article to social media via Buffer, and delivers a WhatsApp confirmation alert via CallMeBot.
+A lightweight, serverless Node.js automation script that runs on a scheduled GitHub Actions workflow. It fetches RSS feed content, scores it with Google Gemini AI, publishes the top-scoring article (with its source link) to social media via Buffer, and delivers a confirmation alert via Telegram.
 
 ---
 
@@ -14,7 +14,7 @@ A lightweight, serverless Node.js automation script that runs on a scheduled Git
    - [Step 2 — AI Scoring via Google Gemini](#step-2--ai-scoring-via-google-gemini)
    - [Step 3 — Threshold Filtering & Winner Selection](#step-3--threshold-filtering--winner-selection)
    - [Step 4 — Buffer GraphQL Post Dispatch](#step-4--buffer-graphql-post-dispatch)
-   - [Step 5 — WhatsApp Notification via CallMeBot](#step-5--whatsapp-notification-via-callmebot)
+   - [Step 5 — Telegram Notification](#step-5--telegram-notification)
 5. [Environment Variables Reference](#environment-variables-reference)
 6. [GitHub Actions Workflow](#github-actions-workflow)
 7. [Error Handling Strategy](#error-handling-strategy)
@@ -34,31 +34,37 @@ A lightweight, serverless Node.js automation script that runs on a scheduled Git
                                │  triggers
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          index.js  (Node 20)                        │
+│                          index.js  (Node 24)                        │
 │                                                                     │
-│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────────┐  │
-│  │  RSS Parser  │───▶│ Time Filter  │───▶│  Gemini 1.5 Flash AI  │  │
-│  │ (multi-feed) │    │  (118 min)   │    │  (score + post text)  │  │
-│  └──────────────┘    └──────────────┘    └───────────┬───────────┘  │
-│                                                      │              │
-│                                          ┌───────────▼───────────┐  │
-│                                          │  Threshold Filter     │  │
-│                                          │  + Winner Selection   │  │
-│                                          └───────────┬───────────┘  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ┌─────────────┐  │
+│  │  RSS Parser  │─▶│ Time Filter  │─▶│  Dedup   │─▶│ Gemini 3.5  │  │
+│  │ (multi-feed) │  │  (118 min)   │  │(posted   │  │ Flash AI    │  │
+│  └──────────────┘  └──────────────┘  │ .json)   │  │(score+post) │  │
+│                                       └──────────┘  └──────┬──────┘  │
+│                                                            │         │
+│                                          ┌─────────────────▼──────┐  │
+│                                          │  Threshold Filter      │  │
+│                                          │  + Winner Selection    │  │
+│                                          │  + append source link  │  │
+│                                          └───────────┬────────────┘  │
 │                                                      │              │
 │                               ┌──────────────────────▼───────────┐  │
-│                               │  Buffer GraphQL API              │  │
+│                               │  Buffer GraphQL API (shareNow)   │  │
 │                               │  (one mutation per channel ID)   │  │
 │                               └──────────────────────┬───────────┘  │
 │                                                      │              │
+│                       ┌──────────────────────────────▼───────────┐  │
+│                       │  Record key → posted.json (commit back)  │  │
+│                       └──────────────────────────────┬───────────┘  │
+│                                                      │              │
 │                                          ┌───────────▼───────────┐  │
-│                                          │  CallMeBot WhatsApp   │  │
-│                                          │  (GET notification)   │  │
+│                                          │  Telegram Bot API     │  │
+│                                          │  (POST notification)  │  │
 │                                          └───────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The entire pipeline is **stateless** — it holds no database, no persistent cache, and no inter-run memory. Every execution is self-contained and safe to re-run.
+The pipeline is **near-stateless** — the only persisted state is `posted.json`, a small deduplication log committed back to the repo after each successful post. There is no database or external cache; every execution is otherwise self-contained and safe to re-run.
 
 ---
 
@@ -82,11 +88,12 @@ AutoRSS/
 
 | Concern | Technology | Reason |
 |---|---|---|
-| Runtime | Node.js v20+ (ES Modules) | Native `fetch`, top-level `await` support, LTS stability |
+| Runtime | Node.js v24 (ES Modules) | Native `fetch`, top-level `await` support, current runner default |
 | RSS Parsing | `rss-parser` npm package | Handles RSS 2.0 and Atom feeds, normalises field names |
-| AI Scoring | `@google/generative-ai` → `gemini-1.5-flash` | Fast inference, enforced JSON output via `responseMimeType` |
+| AI Scoring | `@google/generative-ai` → `gemini-3.5-flash` | Fast inference, enforced JSON output via `responseMimeType` |
 | Social Posting | Native `fetch` → Buffer GraphQL API | No extra SDK needed; GraphQL mutations give precise control |
-| Notifications | Native `fetch` → CallMeBot REST API | Free WhatsApp alerting via a simple GET request |
+| Notifications | Native `fetch` → Telegram Bot API | Free, reliable alerting via a simple POST request |
+| Deduplication | `posted.json` committed back to the repo | Self-contained, no external store needed |
 | Scheduling | GitHub Actions cron | Serverless, free for public repos, no infrastructure to manage |
 | Secret Storage | GitHub Repository Secrets | Encrypted at rest, injected as environment variables at runtime |
 
@@ -237,46 +244,51 @@ The `createPost` return type is a **GraphQL union** — it resolves to either `P
 ```json
 {
   "input": {
-    "text": "<generated social_post_text>",
+    "text": "<generated social_post_text + source link>",
     "channelId": "<current channel ID>",
     "schedulingType": "automatic",
-    "mode": "addToQueue"
+    "mode": "shareNow"
   }
 }
 ```
 
-`schedulingType: "automatic"` and `mode: "addToQueue"` tell Buffer to slot the post into the channel's pre-configured posting schedule rather than publishing it immediately or requiring a specific timestamp.
+`mode: "shareNow"` tells Buffer to publish the post immediately rather than slotting it into the channel's posting schedule. The valid `ShareMode` enum values (from the Buffer schema) are: `shareNow` (publish now), `addToQueue` (next open queue slot), `shareNext` (front of queue), `customScheduled` (a specific `dueAt`), and `recommendedTime` (Buffer's suggested time). The `text` field is the Gemini-generated post with the article's source link appended as `<post>\n\n<link>`.
 
 #### Multi-Channel Loop
 `BUFFER_CHANNEL_IDS` is a comma-separated string of Buffer channel IDs. The script iterates through them **sequentially** (not concurrently) with a `for...of` loop. Each iteration is wrapped in `try/catch` so a failure on one channel (e.g. a disconnected Twitter account) does not prevent the post from being sent to the remaining channels.
 
 ---
 
-### Step 5 — WhatsApp Notification via CallMeBot
+### Step 5 — Telegram Notification
 
-**File location:** `index.js` → `sendWhatsAppAlert(score, title, socialPostText)`
+**File location:** `index.js` → `sendTelegramAlert(score, title, postText)`
 
-#### CallMeBot API
-CallMeBot provides a free WhatsApp messaging API. A pre-activated phone number + API key pair receives messages via a simple HTTP GET request — no server-side WebSocket or webhook setup required.
+#### Telegram Bot API
+A Telegram bot (created via `@BotFather`) sends messages to a chat via a single authenticated HTTP `POST` to `https://api.telegram.org/bot<token>/sendMessage`. No phone activation, webhooks, or polling required — just a bot token and the target chat ID.
 
 #### Message Format
-The notification message uses WhatsApp's lightweight markdown dialect. Asterisks (`*text*`) render as **bold** in WhatsApp:
+The message uses Telegram's **MarkdownV2** dialect (`parse_mode: "MarkdownV2"`). Asterisks render as **bold**, and the run timestamp is included so you can confirm the cron is firing on schedule:
 
 ```
-✅ *Automated Post Queued!*
+✅ Automated Post Queued!
 
-*AI Score:* 87
-*Source Article:* Why Serverless Is Still Winning in 2026
+🕐 Run Time: Tue, 03 Jun 2026 08:00:12 GMT
+AI Score: 87
+Source Article: Why Serverless Is Still Winning in 2026
 
-*Generated Post:*
+Generated Post:
 Serverless adoption hits 68% of new workloads in 2026...
+
+https://example.com/serverless-2026
 ```
 
-#### URL Encoding
-The entire message string is passed through `encodeURIComponent()` before being embedded in the query string. This correctly escapes newlines (`%0A`), asterisks, spaces, and any special characters that would otherwise break the URL or be misinterpreted by the server.
+The `Generated Post` block shows the exact text that was sent to Buffer — including the appended source link.
+
+#### MarkdownV2 Escaping
+MarkdownV2 reserves many characters (`_ * [ ] ( ) ~ \` > # + = | { } . ! -`). Any of these appearing in the article title or post body would otherwise break parsing, so they are escaped with a leading backslash via a small `escapeMd()` helper before the message is assembled. Telegram renders the escaped text correctly (the backslashes are not displayed).
 
 #### Non-Fatal Design
-The entire function body is wrapped in `try/catch`. If the GET request throws (network timeout, DNS failure) or returns a non-200 status, the error is logged as a **warning** and execution continues. The GitHub Actions run does not fail because of a notification hiccup — the social posts have already been queued at this point.
+The entire function body is wrapped in `try/catch`. If the request throws (network timeout, DNS failure) or Telegram returns `{ ok: false }`, the error is logged as a **warning** and execution continues. The GitHub Actions run does not fail because of a notification hiccup — the social posts have already been published at this point.
 
 ---
 
@@ -291,9 +303,9 @@ All variables are read from `process.env` at runtime. In GitHub Actions they are
 | `SCORING_CRITERIA` | Yes | Free text | Natural-language description of your niche and what makes a post worth sharing. This is injected verbatim into the AI system prompt. The more specific, the better the scores. |
 | `POSTING_THRESHOLD` | Yes | Integer 0–100 | Minimum score an article must achieve to be published. Recommended starting point: `75`–`85`. |
 | `BUFFER_API_KEY` | Yes | String | Buffer personal access token from Buffer → Settings → API |
-| `BUFFER_CHANNEL_IDS` | Yes | Comma-separated strings | Buffer channel IDs for the target social accounts. Find these via `GET /channels` or Buffer's web UI. |
-| `CALLMEBOT_PHONE` | Yes | String | WhatsApp-registered phone number with country code, no `+` prefix (e.g. `447911123456`) |
-| `CALLMEBOT_API_KEY` | Yes | String | CallMeBot API key received after activating your number |
+| `BUFFER_CHANNEL_IDS` | Yes | Comma-separated strings | Buffer channel IDs for the target social accounts. Find these via the `channels` GraphQL query or Buffer's web UI. |
+| `TELEGRAM_BOT_TOKEN` | Yes | String | Bot token from `@BotFather` (format: `123456789:ABCdef...`) |
+| `TELEGRAM_CHAT_ID` | Yes | String | Your chat ID from `@userinfobot` (format: `123456789`) |
 
 ### Example `SCORING_CRITERIA` values
 
@@ -345,16 +357,21 @@ jobs:
 
 | Step | Action | What it does |
 |---|---|---|
-| Checkout | `actions/checkout@v4` | Clones the repo so `index.js` and `package.json` are available |
-| Setup Node | `actions/setup-node@v4` with `node-version: '20'` and `cache: 'npm'` | Installs Node 20, caches the npm dependency cache between runs |
+| Checkout | `actions/checkout@v4` | Clones the repo so `index.js`, `package.json`, and `posted.json` are available |
+| Setup Node | `actions/setup-node@v4` with `node-version: '24'` and `cache: 'npm'` | Installs Node 24, caches the npm dependency cache between runs |
 | Install deps | `npm ci` | Installs exact versions from `package-lock.json` — reproducible and faster than `npm install` |
 | Run script | `node index.js` | Executes the pipeline; any non-zero exit code fails the workflow run |
+| Persist history | `if: always()` git commit | Commits the updated `posted.json` back to the repo (only if it changed) |
+| Notify on failure | `if: failure()` curl | Sends a Telegram message with a link to the failed run's logs |
+
+The job also declares `permissions: contents: write` (so it can push `posted.json`) and a top-level `concurrency` group (so two runs never overlap and race the commit-back).
 
 ### Secret Injection
 ```yaml
 env:
-  RSS_FEEDS:          ${{ secrets.RSS_FEEDS }}
-  GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+  RSS_FEEDS:           ${{ secrets.RSS_FEEDS }}
+  GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+  TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
   ...
 ```
 
@@ -374,10 +391,11 @@ The script uses a layered error model:
 | Gemini API | Network error, malformed JSON response | Exits with code 1 — workflow run marked as failed; prompts investigation |
 | No articles pass threshold | All scores below threshold | Exits with code 0 — expected run, not an error |
 | Buffer API (single channel) | GraphQL error, MutationError, network error | Logs error, continues to next channel ID |
-| Buffer API (all channels) | All channel posts fail | Script reaches WhatsApp step and exits cleanly — posts are lost but run is not failed |
-| WhatsApp notification | Any failure | Logged as warning only; never causes non-zero exit |
+| Buffer API (all channels) | All channel posts fail | Article is **not** recorded in `posted.json` (so it can be retried next run); proceeds to notification and exits cleanly |
+| Dedup write | `posted.json` write fails | Logged as warning only; never causes non-zero exit |
+| Telegram notification | Any failure (network, `ok: false`) | Logged as warning only; never causes non-zero exit |
 
-The philosophy is: **posting failures are soft failures; data-pipeline failures are hard failures**. A broken notification API should never mask the fact that posts were queued successfully.
+The philosophy is: **posting failures are soft failures; data-pipeline failures are hard failures**. A broken notification API should never mask the fact that posts were published successfully. Note that the dedup key is recorded **only after** at least one channel accepts the post — a fully failed dispatch leaves the article eligible for retry.
 
 ---
 
@@ -387,22 +405,26 @@ The philosophy is: **posting failures are soft failures; data-pipeline failures 
 - A GitHub account with a repository for this project
 - A Google AI Studio account with an API key ([aistudio.google.com](https://aistudio.google.com))
 - A Buffer account with at least one connected social channel ([buffer.com](https://buffer.com))
-- A WhatsApp number activated with CallMeBot ([callmebot.com](https://www.callmebot.com/blog/free-api-whatsapp-messages/))
+- A Telegram account and a bot created via [@BotFather](https://t.me/BotFather)
 
 ### Step 1 — Push the code
 Push the contents of this directory to your GitHub repository's default branch.
 
 ### Step 2 — Find your Buffer Channel IDs
-Log in to Buffer. Channel IDs are not shown in the UI directly — use one of these methods:
-- Use the Buffer MCP server (if configured) and call `list_channels`
-- Make an authenticated GraphQL query:
-  ```graphql
-  query { channels { id name service } }
-  ```
-  via `curl` or a GraphQL client to `https://api.buffer.com/graphql` with your Bearer token.
+Channel IDs are not shown in the Buffer UI directly. First get your organization ID, then query channels (the `channels` query **requires** an `organizationId` input):
+```graphql
+# 1. Get your organization ID
+{ account { organizations { id name } } }
 
-### Step 3 — Activate CallMeBot
-Send a WhatsApp message to `+34 644 82 14 30` with the text `I allow callmebot to send me messages`. You will receive an API key in reply within a few minutes.
+# 2. List channels for that org
+{ channels(input: { organizationId: "YOUR_ORG_ID" }) { id name service } }
+```
+Send these as authenticated POST requests to `https://api.buffer.com/graphql` with an `Authorization: Bearer <BUFFER_API_KEY>` header. Note that org and channel IDs are **strings** in GraphQL — wrap them in quotes.
+
+### Step 3 — Set up your Telegram bot
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the **bot token**.
+2. Message [@userinfobot](https://t.me/userinfobot) to get your **chat ID**.
+3. Send your new bot any message first — a bot cannot initiate a conversation, so it needs an existing chat to reply into.
 
 ### Step 4 — Add GitHub Repository Secrets
 Navigate to your repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**.
@@ -431,8 +453,8 @@ $env:SCORING_CRITERIA = "We cover AI and developer tools for senior engineers."
 $env:POSTING_THRESHOLD = "75"
 $env:BUFFER_API_KEY = "your-buffer-token"
 $env:BUFFER_CHANNEL_IDS = "channel-id-1,channel-id-2"
-$env:CALLMEBOT_PHONE = "447911123456"
-$env:CALLMEBOT_API_KEY = "your-callmebot-key"
+$env:TELEGRAM_BOT_TOKEN = "123456789:ABCdef..."
+$env:TELEGRAM_CHAT_ID = "123456789"
 ```
 
 ### Set environment variables (bash / macOS / Linux)
@@ -448,7 +470,7 @@ node index.js
 ```
 
 ### Safe dry-run tip
-To test without actually posting to Buffer or sending a WhatsApp message, temporarily comment out the calls to `postToBuffer` and `sendWhatsAppAlert` in `main()` and log the `winner` object instead. All upstream steps (RSS fetch, Gemini scoring, threshold filtering) will execute normally.
+To test without actually posting to Buffer or sending a Telegram message, temporarily comment out the calls to `postToBuffer` and `sendTelegramAlert` in `main()` (and the `savePostedKey` call) and log the `postText` instead. All upstream steps (RSS fetch, dedup, Gemini scoring, threshold filtering) will execute normally.
 
 ---
 
@@ -468,4 +490,4 @@ To test without actually posting to Buffer or sending a WhatsApp message, tempor
 
 - **Gemini `social_post_text` character count is advisory.** The model is instructed to stay under 240 characters (leaving room for the appended source link) but this is not mechanically enforced. If a generated post is over the limit, Twitter may truncate it silently while Threads may accept it (Threads supports up to 500 characters).
 
-- **Buffer's `addToQueue` mode requires a posting schedule.** If the target Buffer channel has no time slots configured in its posting schedule, Buffer may hold the post indefinitely rather than publishing it. Configure at least one daily time slot per channel in the Buffer dashboard.
+- **Posts publish immediately (`shareNow`).** Whenever a qualifying article is found, it is published right away — at whatever time the cron happens to run (including overnight hours in your timezone, since cron is UTC). If you'd rather have Buffer publish only during configured peak slots, change `mode` to `addToQueue` in `index.js` and set up a posting schedule per channel in the Buffer dashboard.
