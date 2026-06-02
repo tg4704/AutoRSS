@@ -1,5 +1,6 @@
 import Parser from 'rss-parser';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { readFile, writeFile } from 'node:fs/promises';
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 const RSS_FEEDS        = process.env.RSS_FEEDS;
@@ -14,6 +15,43 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const BUFFER_GRAPHQL_URL = 'https://api.buffer.com/graphql';
 const MAX_AGE_MS = 118 * 60 * 1000; // 1 hour 58 minutes
 const SNIPPET_MAX_CHARS = 400;
+
+// Deduplication: keys of already-posted articles are persisted between runs so
+// the same story never gets posted twice when cron jitter overlaps the windows.
+const POSTED_DB_PATH = 'posted.json';
+const MAX_POSTED_RECORDS = 500; // keep the file small — only the most recent N keys
+
+// Stable per-article identity. Prefer the feed-provided guid, fall back to link.
+function articleKey(item) {
+  return item?.guid || item?.link || item?.title || '';
+}
+
+async function loadPostedKeys() {
+  try {
+    const raw = await readFile(POSTED_DB_PATH, 'utf-8');
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    // Missing on first run, or unreadable — start with an empty history.
+    return new Set();
+  }
+}
+
+async function savePostedKey(postedKeys, newKey) {
+  if (!newKey) return;
+  const updated = [...postedKeys, newKey].slice(-MAX_POSTED_RECORDS);
+  await writeFile(POSTED_DB_PATH, JSON.stringify(updated, null, 2));
+  console.log(`[Dedup] Recorded posted article key. History size: ${updated.length}.`);
+}
+
+// Map a Gemini-scored result back to its original feed item, so we can recover
+// the source link and dedup key (which Gemini does not echo verbatim).
+function resolveOriginal(winner, articles) {
+  if (Number.isInteger(winner.id) && articles[winner.id]) {
+    return articles[winner.id];
+  }
+  return articles.find((a) => a.title === winner.title) ?? null;
+}
 
 // ── Step 1: Fetch RSS feeds and filter by publication age ──────────────────────
 async function fetchAndFilterArticles() {
@@ -66,7 +104,7 @@ async function scoreArticles(articles) {
         .replace(/\s+/g, ' ')
         .trim();
       return [
-        `--- Article ${i + 1} ---`,
+        `--- Article (ID: ${i}) ---`,
         `Title:   ${item.title ?? 'N/A'}`,
         `Snippet: ${snippet || 'N/A'}`,
         `Link:    ${item.link ?? 'N/A'}`,
@@ -77,17 +115,19 @@ async function scoreArticles(articles) {
   const prompt = `You are an expert social media curator specializing in: ${SCORING_CRITERIA}
 
 Evaluate each article below independently against that niche. For every article, output:
+• id          – copy the exact integer ID shown for the article you are scoring
 • score       – relevance, viral potential, and audience value on a strict 0–100 integer scale
 • reasoning   – one concise sentence explaining the score
-• social_post_text – a compelling social media post strictly under 280 characters that summarises or reacts to the news, with natural relevant keywords (not spammy)
+• social_post_text – a compelling social media post strictly under 240 characters that summarises or reacts to the news, with natural relevant keywords (not spammy). A source link will be appended automatically, so do NOT include any URL and leave room for it.
 
 Return ONLY a valid JSON array. No markdown, no extra text. Schema:
 [
   {
+    "id": 0,
     "title": "Original Article Title",
     "score": 85,
     "reasoning": "Brief evaluation note.",
-    "social_post_text": "Engaging post under 280 chars."
+    "social_post_text": "Engaging post under 240 chars."
   }
 ]
 
@@ -197,6 +237,10 @@ async function sendTelegramAlert(score, title, socialPostText) {
 async function main() {
   console.log(`[${new Date().toISOString()}] AutoRSS run started.`);
 
+  // Load the history of already-posted articles up front.
+  const postedKeys = await loadPostedKeys();
+  console.log(`[Dedup] Loaded ${postedKeys.size} previously-posted article key(s).`);
+
   // ── 1. Fetch & filter ──────────────────────────────────────────────────────
   let articles;
   try {
@@ -211,12 +255,24 @@ async function main() {
     process.exit(0);
   }
 
-  console.log(`[RSS] ${articles.length} recent article(s) found. Sending to Gemini…`);
+  // Drop anything we've already posted in a previous run.
+  const fresh = articles.filter((a) => !postedKeys.has(articleKey(a)));
+  const skipped = articles.length - fresh.length;
+  if (skipped > 0) {
+    console.log(`[Dedup] Skipped ${skipped} already-posted article(s).`);
+  }
+
+  if (fresh.length === 0) {
+    console.log('[Dedup] All recent articles were already posted. Exiting.');
+    process.exit(0);
+  }
+
+  console.log(`[RSS] ${fresh.length} fresh article(s) found. Sending to Gemini…`);
 
   // ── 2. AI scoring ──────────────────────────────────────────────────────────
   let scored;
   try {
-    scored = await scoreArticles(articles);
+    scored = await scoreArticles(fresh);
   } catch (err) {
     console.error('[Gemini] Fatal error during AI scoring:', err.message);
     process.exit(1);
@@ -238,24 +294,45 @@ async function main() {
 
   const winner = passing.reduce((best, curr) => (curr.score > best.score ? curr : best));
 
+  // Recover the original feed item so we can append its source link and dedup it.
+  const original = resolveOriginal(winner, fresh);
+  const sourceLink = original?.link ?? '';
+  const postText = sourceLink
+    ? `${winner.social_post_text}\n\n${sourceLink}`
+    : winner.social_post_text;
+
   console.log(`[Filter] Winner: "${winner.title}"`);
   console.log(`[Filter] Score:  ${winner.score}`);
   console.log(`[Filter] Reason: ${winner.reasoning}`);
-  console.log(`[Filter] Post:   ${winner.social_post_text}`);
+  console.log(`[Filter] Link:   ${sourceLink || '(none found)'}`);
+  console.log(`[Filter] Post:   ${postText}`);
 
   // ── 4. Dispatch to Buffer ──────────────────────────────────────────────────
   const channelIds = BUFFER_CHANNEL_IDS.split(',').map((id) => id.trim()).filter(Boolean);
 
+  let anySuccess = false;
   for (const channelId of channelIds) {
     try {
-      await postToBuffer(channelId, winner.social_post_text);
+      const ok = await postToBuffer(channelId, postText);
+      if (ok) anySuccess = true;
     } catch (err) {
       console.error(`[Buffer] Error posting to channel ${channelId}: ${err.message}`);
     }
   }
 
-  // ── 5. WhatsApp alert ──────────────────────────────────────────────────────
-  await sendTelegramAlert(winner.score, winner.title, winner.social_post_text);
+  // Only record the article as posted if at least one channel accepted it.
+  if (anySuccess) {
+    try {
+      await savePostedKey(postedKeys, articleKey(original));
+    } catch (err) {
+      console.warn(`[Dedup] Failed to persist posted key (non-fatal): ${err.message}`);
+    }
+  } else {
+    console.warn('[Buffer] No channel accepted the post — not recording in history.');
+  }
+
+  // ── 5. Telegram alert ──────────────────────────────────────────────────────
+  await sendTelegramAlert(winner.score, winner.title, postText);
 
   console.log(`[${new Date().toISOString()}] AutoRSS run completed.`);
   process.exit(0);

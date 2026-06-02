@@ -5,10 +5,19 @@ on:
     - cron: '0 */2 * * *'   # Every 2 hours on the hour
   workflow_dispatch:          # Allow manual trigger from the GitHub UI
 
+# Never let two runs overlap — protects the posted.json commit-back from racing.
+concurrency:
+  group: autorss
+  cancel-in-progress: false
+
 jobs:
   run-autorss:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    # Required so the workflow can commit the updated posted.json back to the repo.
+    permissions:
+      contents: write
 
     env:
       RSS_FEEDS:           ${{ secrets.RSS_FEEDS }}
@@ -35,6 +44,19 @@ jobs:
 
       - name: Run AutoRSS script
         run: node index.js
+
+      - name: Persist posted history
+        if: always()
+        run: |
+          if [[ -n "$(git status --porcelain posted.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add posted.json
+            git commit -m "chore: update posted history [skip ci]"
+            git push
+          else
+            echo "No changes to posted.json — nothing to commit."
+          fi
 
       - name: Notify on failure
         if: failure()

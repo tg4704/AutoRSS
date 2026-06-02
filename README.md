@@ -68,10 +68,13 @@ The entire pipeline is **stateless** — it holds no database, no persistent cac
 AutoRSS/
 ├── index.js                        # Core automation script (ES Module)
 ├── package.json                    # Node.js project manifest
+├── posted.json                     # Dedup history — keys of already-posted articles
 └── .github/
     └── workflows/
         └── cron-job.yml            # GitHub Actions scheduled workflow
 ```
+
+> `posted.json` is committed back to the repo automatically by the workflow after each successful post. It starts as an empty array `[]` and grows to a rolling window of the most recent 500 posted-article keys.
 
 ---
 
@@ -166,12 +169,13 @@ Each article in the output array contains:
 
 | Field | Type | Description |
 |---|---|---|
+| `id` | integer | The article's index in the batch, echoed back so the winner can be mapped to its original feed item (to recover the source link and dedup key) |
 | `title` | string | The original article title, echoed back |
 | `score` | integer | 0–100 relevance and quality score |
 | `reasoning` | string | One sentence explaining the score |
-| `social_post_text` | string | Ready-to-publish post, under 280 characters |
+| `social_post_text` | string | Ready-to-publish post, under 240 characters (the source link is appended afterward) |
 
-The `social_post_text` character limit is enforced by instruction in the prompt. Gemini generally respects this constraint, though the downstream WhatsApp notification would still work if a post were slightly over.
+The `social_post_text` character limit is enforced by instruction in the prompt. The target is 240 (not 280) to leave room for the source article link, which is appended automatically after scoring (`<post>\n\n<link>`). Twitter shortens any URL to 23 characters via `t.co`, so 240 + a link stays comfortably under the 280 limit.
 
 ---
 
@@ -458,8 +462,10 @@ To test without actually posting to Buffer or sending a WhatsApp message, tempor
 
 - **One post per run, not per matching article.** Even if five articles pass the scoring threshold, only the single highest-scoring article is published. This is by design to avoid flooding social channels.
 
-- **No deduplication between runs.** If the same article appears in the RSS feed across two consecutive runs (i.e. it was published close to the hour boundary and is still within the 118-minute window on the next run), it could be posted twice. To prevent this, consider maintaining a small seen-IDs log in a GitHub Actions cache or a free key-value store.
+- **Exact-article deduplication is handled; semantic deduplication is not.** Each posted article's `guid`/`link` is recorded in `posted.json` and skipped on future runs, so the *same* article URL is never posted twice. However, if the *same news story* is carried by multiple feeds under different URLs, each is treated as a distinct article and a near-duplicate could still be posted on a later run. Solving that would require semantic similarity comparison, which is intentionally out of scope.
 
-- **Gemini `social_post_text` character count is advisory.** The model is instructed to stay under 280 characters but this is not mechanically enforced. If a generated post is over the limit, Twitter may truncate it silently while Threads may accept it (Threads supports up to 500 characters).
+- **Dedup depends on the commit-back landing.** The workflow commits the updated `posted.json` back to the repo after each run. If that push fails (e.g. permissions misconfigured), the next run won't see the latest history and could re-post. The `concurrency` group prevents overlapping runs from racing the push.
+
+- **Gemini `social_post_text` character count is advisory.** The model is instructed to stay under 240 characters (leaving room for the appended source link) but this is not mechanically enforced. If a generated post is over the limit, Twitter may truncate it silently while Threads may accept it (Threads supports up to 500 characters).
 
 - **Buffer's `addToQueue` mode requires a posting schedule.** If the target Buffer channel has no time slots configured in its posting schedule, Buffer may hold the post indefinitely rather than publishing it. Configure at least one daily time slot per channel in the Buffer dashboard.
