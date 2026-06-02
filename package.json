@@ -1,0 +1,17 @@
+{
+  "name": "autorss",
+  "version": "1.0.0",
+  "description": "Automated RSS feed processor with AI scoring and Buffer social posting",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "rss-parser": "^3.13.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
