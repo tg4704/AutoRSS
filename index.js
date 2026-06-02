@@ -18,7 +18,10 @@ const SNIPPET_MAX_CHARS = 400;
 // ── Step 1: Fetch RSS feeds and filter by publication age ──────────────────────
 async function fetchAndFilterArticles() {
   const parser = new Parser({
-    headers: { 'User-Agent': 'AutoRSS/1.0 (RSS reader bot)' },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; AutoRSS/1.0; +https://github.com/your-username/AutoRSS)',
+      'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+    },
   });
   const feedUrls = RSS_FEEDS.split(',').map(u => u.trim()).filter(Boolean);
 
