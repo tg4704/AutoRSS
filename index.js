@@ -118,8 +118,8 @@ async function postToBuffer(channelId, text) {
     input: {
       text,
       channelId,
-      schedulingType: 'immediate',
-      mode: 'now',
+      schedulingType: 'automatic',
+      mode: 'shareNow',
     },
   };
 
