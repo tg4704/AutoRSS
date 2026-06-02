@@ -161,11 +161,14 @@ async function postToBuffer(channelId, text) {
 
 // ── Step 5: Telegram notification ────────────────────────────────────────────
 async function sendTelegramAlert(score, title, socialPostText) {
+  const runTime = new Date().toUTCString();
+  const escapeMd = (str) => str.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
   const message =
     `✅ *Automated Post Queued\\!*\n\n` +
+    `*🕐 Run Time:* ${escapeMd(runTime)}\n` +
     `*AI Score:* ${score}\n` +
-    `*Source Article:* ${title.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&')}\n\n` +
-    `*Generated Post:*\n${socialPostText.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&')}`;
+    `*Source Article:* ${escapeMd(title)}\n\n` +
+    `*Generated Post:*\n${escapeMd(socialPostText)}`;
 
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
