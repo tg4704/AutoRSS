@@ -17,8 +17,8 @@ jobs:
       POSTING_THRESHOLD:   ${{ secrets.POSTING_THRESHOLD }}
       BUFFER_API_KEY:      ${{ secrets.BUFFER_API_KEY }}
       BUFFER_CHANNEL_IDS:  ${{ secrets.BUFFER_CHANNEL_IDS }}
-      CALLMEBOT_PHONE:     ${{ secrets.CALLMEBOT_PHONE }}
-      CALLMEBOT_API_KEY:   ${{ secrets.CALLMEBOT_API_KEY }}
+      TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout repository
@@ -40,5 +40,6 @@ jobs:
         if: failure()
         run: |
           MESSAGE="❌ AutoRSS run FAILED on $(date -u '+%Y-%m-%d %H:%M UTC'). Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          ENCODED=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$MESSAGE")
-          curl -s "https://api.callmebot.com/whatsapp.php?phone=${{ secrets.CALLMEBOT_PHONE }}&text=${ENCODED}&apikey=${{ secrets.CALLMEBOT_API_KEY }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${{ secrets.TELEGRAM_CHAT_ID }}\",\"text\":\"${MESSAGE}\"}"

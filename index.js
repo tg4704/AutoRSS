@@ -8,8 +8,8 @@ const SCORING_CRITERIA = process.env.SCORING_CRITERIA;
 const POSTING_THRESHOLD = parseInt(process.env.POSTING_THRESHOLD ?? '80', 10);
 const BUFFER_API_KEY   = process.env.BUFFER_API_KEY;
 const BUFFER_CHANNEL_IDS = process.env.BUFFER_CHANNEL_IDS;
-const CALLMEBOT_PHONE  = process.env.CALLMEBOT_PHONE;
-const CALLMEBOT_API_KEY = process.env.CALLMEBOT_API_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
 const BUFFER_GRAPHQL_URL = 'https://api.buffer.com/graphql';
 const MAX_AGE_MS = 118 * 60 * 1000; // 1 hour 58 minutes
@@ -17,7 +17,9 @@ const SNIPPET_MAX_CHARS = 400;
 
 // ── Step 1: Fetch RSS feeds and filter by publication age ──────────────────────
 async function fetchAndFilterArticles() {
-  const parser = new Parser();
+  const parser = new Parser({
+    headers: { 'User-Agent': 'AutoRSS/1.0 (RSS reader bot)' },
+  });
   const feedUrls = RSS_FEEDS.split(',').map(u => u.trim()).filter(Boolean);
 
   const feedResults = await Promise.all(
@@ -116,8 +118,8 @@ async function postToBuffer(channelId, text) {
     input: {
       text,
       channelId,
-      schedulingType: 'automatic',
-      mode: 'addToQueue',
+      schedulingType: 'immediate',
+      mode: 'now',
     },
   };
 
@@ -154,29 +156,34 @@ async function postToBuffer(channelId, text) {
   return false;
 }
 
-// ── Step 5: WhatsApp alert via CallMeBot ──────────────────────────────────────
-async function sendWhatsAppAlert(score, title, socialPostText) {
+// ── Step 5: Telegram notification ────────────────────────────────────────────
+async function sendTelegramAlert(score, title, socialPostText) {
   const message =
-    `✅ *Automated Post Queued!*\n\n` +
+    `✅ *Automated Post Queued\\!*\n\n` +
     `*AI Score:* ${score}\n` +
-    `*Source Article:* ${title}\n\n` +
-    `*Generated Post:*\n${socialPostText}`;
+    `*Source Article:* ${title.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&')}\n\n` +
+    `*Generated Post:*\n${socialPostText.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&')}`;
 
-  const url =
-    `https://api.callmebot.com/whatsapp.php` +
-    `?phone=${encodeURIComponent(CALLMEBOT_PHONE)}` +
-    `&text=${encodeURIComponent(message)}` +
-    `&apikey=${encodeURIComponent(CALLMEBOT_API_KEY)}`;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
   try {
-    const res = await fetch(url);
-    if (res.ok) {
-      console.log('[WhatsApp] Notification sent successfully.');
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: 'MarkdownV2',
+      }),
+    });
+    const json = await res.json();
+    if (json.ok) {
+      console.log('[Telegram] Notification sent successfully.');
     } else {
-      console.warn(`[WhatsApp] Notification returned HTTP ${res.status} (non-fatal).`);
+      console.warn(`[Telegram] Notification failed (non-fatal): ${json.description}`);
     }
   } catch (err) {
-    console.warn(`[WhatsApp] Notification failed (non-fatal): ${err.message}`);
+    console.warn(`[Telegram] Notification failed (non-fatal): ${err.message}`);
   }
 }
 
@@ -242,9 +249,10 @@ async function main() {
   }
 
   // ── 5. WhatsApp alert ──────────────────────────────────────────────────────
-  await sendWhatsAppAlert(winner.score, winner.title, winner.social_post_text);
+  await sendTelegramAlert(winner.score, winner.title, winner.social_post_text);
 
   console.log(`[${new Date().toISOString()}] AutoRSS run completed.`);
+  process.exit(0);
 }
 
 main();
