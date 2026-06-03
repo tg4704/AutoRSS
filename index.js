@@ -3,51 +3,83 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { readFile, writeFile } from 'node:fs/promises';
 
 // ── Configuration ──────────────────────────────────────────────────────────────
-const RSS_FEEDS        = process.env.RSS_FEEDS;
-const GEMINI_API_KEY   = process.env.GEMINI_API_KEY;
-const SCORING_CRITERIA = process.env.SCORING_CRITERIA;
-const POSTING_THRESHOLD = parseInt(process.env.POSTING_THRESHOLD ?? '80', 10);
-const BUFFER_API_KEY   = process.env.BUFFER_API_KEY;
+const RSS_FEEDS          = process.env.RSS_FEEDS;
+const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
+const SCORING_CRITERIA   = process.env.SCORING_CRITERIA;
+const POSTING_THRESHOLD  = parseInt(process.env.POSTING_THRESHOLD ?? '80', 10);
+const BUFFER_API_KEY     = process.env.BUFFER_API_KEY;
 const BUFFER_CHANNEL_IDS = process.env.BUFFER_CHANNEL_IDS;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
 const BUFFER_GRAPHQL_URL = 'https://api.buffer.com/graphql';
-// Wide enough to absorb GitHub's delayed/skipped scheduled runs. Dedup
-// (posted.json) prevents the overlap from ever causing a repost.
+
+// Wide enough to absorb missed/delayed external triggers. Dedup prevents reposts.
 const MAX_AGE_MS = 240 * 60 * 1000; // 4 hours
 const SNIPPET_MAX_CHARS = 400;
 
-// Deduplication: keys of already-posted articles are persisted between runs so
-// the same story never gets posted twice when cron jitter overlaps the windows.
-const POSTED_DB_PATH = 'posted.json';
-const MAX_POSTED_RECORDS = 500; // keep the file small — only the most recent N keys
+// ── JC special feed ────────────────────────────────────────────────────────────
+// Supplemented automatically when the regular pool has fewer than 10 fresh articles.
+const JC_RSS_URL        = 'https://jimconnors.net/?format=rss';
+const JC_MIN_POOL       = 10;  // trigger threshold
+const JC_PICK_COUNT     = 10;  // how many JC articles to add
+const JC_NUMBER_RE      = /JC\s*#(\d+)/i;
 
-// Stable per-article identity. Prefer the feed-provided guid, fall back to link.
-function articleKey(item) {
-  return item?.guid || item?.link || item?.title || '';
+function extractJCNumber(title) {
+  const m = (title ?? '').match(JC_NUMBER_RE);
+  return m ? parseInt(m[1], 10) : null;
 }
 
-async function loadPostedKeys() {
+// ── Persistence (posted.json) ──────────────────────────────────────────────────
+// Schema v2: { articleKeys: string[], jcUsed: number[] }
+// Migrates transparently from the old v1 flat-array format.
+const POSTED_DB_PATH    = 'posted.json';
+const MAX_POSTED_RECORDS = 500;
+
+async function loadPostedDB() {
   try {
-    const raw = await readFile(POSTED_DB_PATH, 'utf-8');
-    const arr = JSON.parse(raw);
-    return new Set(Array.isArray(arr) ? arr : []);
+    const raw  = await readFile(POSTED_DB_PATH, 'utf-8');
+    const data = JSON.parse(raw);
+
+    // v1 → v2 migration: old file was a plain array of article keys
+    if (Array.isArray(data)) {
+      console.log('[Dedup] Migrating posted.json from v1 to v2 format.');
+      return {
+        articleKeys: new Set(data),
+        jcUsed:      new Set(),
+      };
+    }
+
+    return {
+      articleKeys: new Set(Array.isArray(data.articleKeys) ? data.articleKeys : []),
+      jcUsed:      new Set(Array.isArray(data.jcUsed)      ? data.jcUsed      : []),
+    };
   } catch {
-    // Missing on first run, or unreadable — start with an empty history.
-    return new Set();
+    return { articleKeys: new Set(), jcUsed: new Set() };
   }
 }
 
-async function savePostedKey(postedKeys, newKey) {
-  if (!newKey) return;
-  const updated = [...postedKeys, newKey].slice(-MAX_POSTED_RECORDS);
-  await writeFile(POSTED_DB_PATH, JSON.stringify(updated, null, 2));
-  console.log(`[Dedup] Recorded posted article key. History size: ${updated.length}.`);
+async function savePostedDB(db, { newArticleKey = null, newJcNumber = null } = {}) {
+  const articleKeys = [...db.articleKeys];
+  if (newArticleKey) articleKeys.push(newArticleKey);
+
+  const jcUsed = [...db.jcUsed];
+  if (newJcNumber != null) jcUsed.push(newJcNumber);
+
+  const payload = {
+    articleKeys: articleKeys.slice(-MAX_POSTED_RECORDS),
+    jcUsed:      jcUsed.slice(-MAX_POSTED_RECORDS),
+  };
+
+  await writeFile(POSTED_DB_PATH, JSON.stringify(payload, null, 2));
+  console.log(
+    `[Dedup] DB saved. articleKeys: ${payload.articleKeys.length}, jcUsed: ${payload.jcUsed.length}.`
+  );
 }
 
-// Map a Gemini-scored result back to its original feed item, so we can recover
-// the source link and dedup key (which Gemini does not echo verbatim).
+// ── Helpers ────────────────────────────────────────────────────────────────────
+// Map a Gemini-scored result back to its original feed item to recover the
+// source link, dedup key, and JC metadata (Gemini does not echo these).
 function resolveOriginal(winner, articles) {
   if (Number.isInteger(winner.id) && articles[winner.id]) {
     return articles[winner.id];
@@ -55,14 +87,20 @@ function resolveOriginal(winner, articles) {
   return articles.find((a) => a.title === winner.title) ?? null;
 }
 
-// ── Step 1: Fetch RSS feeds and filter by publication age ──────────────────────
+// Stable per-article identity for regular feeds.
+function articleKey(item) {
+  return item?.guid || item?.link || item?.title || '';
+}
+
+// ── Step 1a: Fetch & time-filter regular RSS feeds ─────────────────────────────
 async function fetchAndFilterArticles() {
   const parser = new Parser({
     headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; AutoRSS/1.0; +https://github.com/your-username/AutoRSS)',
-      'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+      'User-Agent': 'Mozilla/5.0 (compatible; AutoRSS/1.0; +https://github.com/tg4704/AutoRSS)',
+      'Accept':     'application/rss+xml, application/xml, text/xml, */*',
     },
   });
+
   const feedUrls = RSS_FEEDS.split(',').map(u => u.trim()).filter(Boolean);
 
   const feedResults = await Promise.all(
@@ -77,18 +115,48 @@ async function fetchAndFilterArticles() {
     })
   );
 
-  const now = Date.now();
+  const now      = Date.now();
   const allItems = feedResults.flat();
 
-  const recent = allItems.filter((item) => {
+  return allItems.filter((item) => {
     const dateStr = item.isoDate ?? item.pubDate;
     if (!dateStr) return false;
     const pubTime = new Date(dateStr).getTime();
     if (isNaN(pubTime)) return false;
     return now - pubTime <= MAX_AGE_MS;
   });
+}
 
-  return recent;
+// ── Step 1b: Fetch JC supplement feed ─────────────────────────────────────────
+async function fetchJCArticles(jcUsed) {
+  const parser = new Parser({
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; AutoRSS/1.0; +https://github.com/tg4704/AutoRSS)',
+      'Accept':     'application/rss+xml, application/xml, text/xml, */*',
+    },
+  });
+
+  try {
+    const feed  = await parser.parseURL(JC_RSS_URL);
+    const items = (feed.items ?? [])
+      .map((item) => {
+        const jcNumber = extractJCNumber(item.title);
+        return { ...item, _isJC: true, _jcNumber: jcNumber };
+      })
+      .filter((item) => item._jcNumber !== null && !jcUsed.has(item._jcNumber));
+
+    // Shuffle so we don't always pick the most-recent JC articles
+    const shuffled = items.sort(() => Math.random() - 0.5);
+    const picked   = shuffled.slice(0, JC_PICK_COUNT);
+
+    console.log(
+      `[JC] Fetched ${items.length} unused JC article(s). Picking ${picked.length}.`
+    );
+    return picked;
+  } catch (err) {
+    console.error(`[JC] Failed to fetch JC feed: ${err.message}`);
+    return [];
+  }
 }
 
 // ── Step 2: Score articles via Gemini ─────────────────────────────────────────
@@ -118,12 +186,12 @@ async function scoreArticles(articles) {
 
 ━━━ SCORING ━━━
 For each article output:
-• id       – the exact integer ID shown
-• score    – 0 to 100 (relevance + viral potential + audience value)
+• id        – the exact integer ID shown
+• score     – 0 to 100 (relevance + viral potential + audience value)
 • reasoning – one sentence explaining the score
 
 ━━━ WRITING THE POST (social_post_text) ━━━
-Write a post strictly under 240 characters. A link may be appended after, so do NOT include any URL.
+Write a post strictly under 240 characters. Do NOT include any URL.
 
 STRICT RULES — break any of these and the post is rejected:
 1. ZERO em dashes (— or –). Never use them. Use a comma, a period, or a line break instead.
@@ -173,7 +241,7 @@ Return ONLY a valid JSON array. No markdown, no extra text. Schema:
 Articles:
 ${articlesPayload}`;
 
-  const result = await model.generateContent(prompt);
+  const result  = await model.generateContent(prompt);
   const rawText = result.response.text().trim();
 
   return JSON.parse(rawText);
@@ -209,7 +277,7 @@ async function postToBuffer(channelId, text) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${BUFFER_API_KEY}`,
+      Authorization:  `Bearer ${BUFFER_API_KEY}`,
     },
     body: JSON.stringify({ query: CREATE_POST_MUTATION, variables }),
   });
@@ -224,13 +292,12 @@ async function postToBuffer(channelId, text) {
   const outcome = json?.data?.createPost;
 
   if (outcome?.message) {
-    // MutationError union branch
     console.error(`[Buffer] MutationError for channel ${channelId}: ${outcome.message}`);
     return false;
   }
 
   if (outcome?.post?.id) {
-    console.log(`[Buffer] Post queued for channel ${channelId} → post ID: ${outcome.post.id}`);
+    console.log(`[Buffer] Post published to channel ${channelId} → post ID: ${outcome.post.id}`);
     return true;
   }
 
@@ -238,18 +305,18 @@ async function postToBuffer(channelId, text) {
   return false;
 }
 
-// ── Step 5: Telegram notification ────────────────────────────────────────────
+// ── Step 5: Telegram notifications ───────────────────────────────────────────
 const escapeMd = (str) => String(str).replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
 
 async function sendTelegramMessage(message) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
-    const res = await fetch(url, {
-      method: 'POST',
+    const res  = await fetch(url, {
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
+      body:    JSON.stringify({
+        chat_id:    TELEGRAM_CHAT_ID,
+        text:       message,
         parse_mode: 'MarkdownV2',
       }),
     });
@@ -264,11 +331,16 @@ async function sendTelegramMessage(message) {
   }
 }
 
-async function sendTelegramAlert(score, title, socialPostText) {
+// Success alert — includes a JC badge line when the winner came from the JC feed
+async function sendTelegramAlert(score, title, socialPostText, jcNumber = null) {
   const runTime = new Date().toUTCString();
+  const jcLine  = jcNumber != null
+    ? `*📖 JC Article:* \\#${jcNumber}\n`
+    : '';
   const message =
     `✅ *Automated Post Queued\\!*\n\n` +
     `*🕐 Run Time:* ${escapeMd(runTime)}\n` +
+    jcLine +
     `*AI Score:* ${score}\n` +
     `*Source Article:* ${escapeMd(title)}\n\n` +
     `*Generated Post:*\n${escapeMd(socialPostText)}`;
@@ -290,11 +362,13 @@ async function sendTelegramThresholdAlert(topScore, threshold) {
 async function main() {
   console.log(`[${new Date().toISOString()}] AutoRSS run started.`);
 
-  // Load the history of already-posted articles up front.
-  const postedKeys = await loadPostedKeys();
-  console.log(`[Dedup] Loaded ${postedKeys.size} previously-posted article key(s).`);
+  // Load the full persistence DB (article dedup keys + used JC numbers).
+  const db = await loadPostedDB();
+  console.log(
+    `[Dedup] Loaded ${db.articleKeys.size} article key(s), ${db.jcUsed.size} used JC number(s).`
+  );
 
-  // ── 1. Fetch & filter ──────────────────────────────────────────────────────
+  // ── 1a. Fetch & filter regular feeds ──────────────────────────────────────
   let articles;
   try {
     articles = await fetchAndFilterArticles();
@@ -308,24 +382,36 @@ async function main() {
     process.exit(0);
   }
 
-  // Drop anything we've already posted in a previous run.
-  const fresh = articles.filter((a) => !postedKeys.has(articleKey(a)));
+  // Deduplicate against posting history.
+  const fresh   = articles.filter((a) => !db.articleKeys.has(articleKey(a)));
   const skipped = articles.length - fresh.length;
   if (skipped > 0) {
     console.log(`[Dedup] Skipped ${skipped} already-posted article(s).`);
   }
 
-  if (fresh.length === 0) {
-    console.log('[Dedup] All recent articles were already posted. Exiting.');
+  // ── 1b. JC supplement — kick in when the regular pool is thin ─────────────
+  let pool = fresh;
+  if (fresh.length < JC_MIN_POOL) {
+    console.log(
+      `[JC] Regular pool has ${fresh.length} article(s) (< ${JC_MIN_POOL}). ` +
+      `Fetching JC supplement…`
+    );
+    const jcArticles = await fetchJCArticles(db.jcUsed);
+    pool = [...fresh, ...jcArticles];
+    console.log(`[JC] Combined pool size: ${pool.length} article(s).`);
+  }
+
+  if (pool.length === 0) {
+    console.log('[RSS] No fresh articles available after dedup and JC supplement. Exiting.');
     process.exit(0);
   }
 
-  console.log(`[RSS] ${fresh.length} fresh article(s) found. Sending to Gemini…`);
+  console.log(`[RSS] ${pool.length} article(s) ready for scoring. Sending to Gemini…`);
 
   // ── 2. AI scoring ──────────────────────────────────────────────────────────
   let scored;
   try {
-    scored = await scoreArticles(fresh);
+    scored = await scoreArticles(pool);
   } catch (err) {
     console.error('[Gemini] Fatal error during AI scoring:', err.message);
     process.exit(1);
@@ -346,24 +432,27 @@ async function main() {
     process.exit(0);
   }
 
-  const winner = passing.reduce((best, curr) => (curr.score > best.score ? curr : best));
+  const winner   = passing.reduce((best, curr) => (curr.score > best.score ? curr : best));
+  const original = resolveOriginal(winner, pool);
 
-  // Recover the original feed item so we can append its source link and dedup it.
-  const original = resolveOriginal(winner, fresh);
-  const sourceLink = original?.link ?? '';
-  // Randomly include the source link ~60% of the time so posts don't look
-  // identical in structure every run. When skipped the post stands on its own.
-  const shouldAppendLink = sourceLink && Math.random() < 0.6;
-  const postText = shouldAppendLink
+  // Detect whether the winner is a JC article
+  const isJC    = original?._isJC === true;
+  const jcNumber = isJC ? original._jcNumber : null;
+
+  // JC articles never get a link appended (per spec).
+  // Regular articles: append link ~60% of the time for variety.
+  const sourceLink      = original?.link ?? '';
+  const shouldAppendLink = !isJC && sourceLink && Math.random() < 0.6;
+  const postText        = shouldAppendLink
     ? `${winner.social_post_text}\n\n${sourceLink}`
     : winner.social_post_text;
-  console.log(`[Filter] Link appended: ${shouldAppendLink ? 'yes' : 'no (randomly skipped)'}`);
 
-  console.log(`[Filter] Winner: "${winner.title}"`);
-  console.log(`[Filter] Score:  ${winner.score}`);
-  console.log(`[Filter] Reason: ${winner.reasoning}`);
-  console.log(`[Filter] Link:   ${sourceLink || '(none found)'}`);
-  console.log(`[Filter] Post:   ${postText}`);
+  console.log(`[Filter] Winner:       "${winner.title}"`);
+  console.log(`[Filter] Score:        ${winner.score}`);
+  console.log(`[Filter] Reason:       ${winner.reasoning}`);
+  console.log(`[Filter] JC article:   ${isJC ? `yes (#${jcNumber})` : 'no'}`);
+  console.log(`[Filter] Link appended:${shouldAppendLink ? ' yes' : ' no'}`);
+  console.log(`[Filter] Post:\n${postText}`);
 
   // ── 4. Dispatch to Buffer ──────────────────────────────────────────────────
   const channelIds = BUFFER_CHANNEL_IDS.split(',').map((id) => id.trim()).filter(Boolean);
@@ -378,19 +467,22 @@ async function main() {
     }
   }
 
-  // Only record the article as posted if at least one channel accepted it.
+  // Persist the dedup record only after at least one channel accepted the post.
   if (anySuccess) {
     try {
-      await savePostedKey(postedKeys, articleKey(original));
+      await savePostedDB(db, {
+        newArticleKey: isJC ? null : articleKey(original),
+        newJcNumber:   isJC ? jcNumber : null,
+      });
     } catch (err) {
-      console.warn(`[Dedup] Failed to persist posted key (non-fatal): ${err.message}`);
+      console.warn(`[Dedup] Failed to persist DB (non-fatal): ${err.message}`);
     }
   } else {
     console.warn('[Buffer] No channel accepted the post — not recording in history.');
   }
 
   // ── 5. Telegram alert ──────────────────────────────────────────────────────
-  await sendTelegramAlert(winner.score, winner.title, postText);
+  await sendTelegramAlert(winner.score, winner.title, postText, jcNumber);
 
   console.log(`[${new Date().toISOString()}] AutoRSS run completed.`);
   process.exit(0);
