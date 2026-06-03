@@ -18,6 +18,17 @@ const BUFFER_GRAPHQL_URL = 'https://api.buffer.com/graphql';
 const MAX_AGE_MS = 240 * 60 * 1000; // 4 hours
 const SNIPPET_MAX_CHARS = 400;
 
+// Gemini resilience: try the primary model, fall back to a second model, and
+// retry transient errors (503 overload, 429 rate limit, 500) with backoff.
+const GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-2.5-flash'];
+const GEMINI_MAX_RETRIES = 3;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isTransientGeminiError(err) {
+  const msg = String(err?.message ?? '');
+  return /\b(429|500|503)\b|overload|high demand|service unavailable|rate limit|try again/i.test(msg);
+}
+
 // ── JC special feed ────────────────────────────────────────────────────────────
 // Supplemented automatically when the regular pool has fewer than 10 fresh articles.
 const JC_RSS_URL        = 'https://jimconnors.net/?format=rss';
@@ -159,14 +170,54 @@ async function fetchJCArticles(jcUsed) {
   }
 }
 
+// Calls Gemini with retry + model fallback. Returns the raw JSON text, or
+// throws if every model and retry is exhausted.
+async function generateWithRetry(prompt) {
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  let lastErr;
+
+  for (let m = 0; m < GEMINI_MODELS.length; m++) {
+    const modelName = GEMINI_MODELS[m];
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+      generationConfig: { responseMimeType: 'application/json' },
+    });
+
+    for (let attempt = 1; attempt <= GEMINI_MAX_RETRIES; attempt++) {
+      try {
+        const result = await model.generateContent(prompt);
+        if (m > 0 || attempt > 1) {
+          console.log(`[Gemini] Succeeded with ${modelName} (attempt ${attempt}).`);
+        }
+        return result.response.text().trim();
+      } catch (err) {
+        lastErr = err;
+
+        // Permanent errors (bad key, bad request) won't be fixed by retrying.
+        if (!isTransientGeminiError(err)) throw err;
+
+        if (attempt < GEMINI_MAX_RETRIES) {
+          const delay = 2000 * 2 ** (attempt - 1); // 2s, 4s, 8s
+          console.warn(
+            `[Gemini] ${modelName} transient error (attempt ${attempt}/${GEMINI_MAX_RETRIES}): ` +
+            `${err.message}. Retrying in ${delay}ms…`
+          );
+          await sleep(delay);
+        } else {
+          console.warn(
+            `[Gemini] ${modelName} still failing after ${GEMINI_MAX_RETRIES} attempts. ` +
+            (m < GEMINI_MODELS.length - 1 ? 'Trying fallback model…' : 'No models left.')
+          );
+        }
+      }
+    }
+  }
+
+  throw lastErr;
+}
+
 // ── Step 2: Score articles via Gemini ─────────────────────────────────────────
 async function scoreArticles(articles) {
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-3.5-flash',
-    generationConfig: { responseMimeType: 'application/json' },
-  });
-
   const articlesPayload = articles
     .map((item, i) => {
       const snippet = (item.contentSnippet ?? item.summary ?? '')
@@ -241,9 +292,7 @@ Return ONLY a valid JSON array. No markdown, no extra text. Schema:
 Articles:
 ${articlesPayload}`;
 
-  const result  = await model.generateContent(prompt);
-  const rawText = result.response.text().trim();
-
+  const rawText = await generateWithRetry(prompt);
   return JSON.parse(rawText);
 }
 
