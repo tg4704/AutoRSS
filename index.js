@@ -202,18 +202,10 @@ async function postToBuffer(channelId, text) {
 }
 
 // ── Step 5: Telegram notification ────────────────────────────────────────────
-async function sendTelegramAlert(score, title, socialPostText) {
-  const runTime = new Date().toUTCString();
-  const escapeMd = (str) => str.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
-  const message =
-    `✅ *Automated Post Queued\\!*\n\n` +
-    `*🕐 Run Time:* ${escapeMd(runTime)}\n` +
-    `*AI Score:* ${score}\n` +
-    `*Source Article:* ${escapeMd(title)}\n\n` +
-    `*Generated Post:*\n${escapeMd(socialPostText)}`;
+const escapeMd = (str) => String(str).replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
 
+async function sendTelegramMessage(message) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -233,6 +225,28 @@ async function sendTelegramAlert(score, title, socialPostText) {
   } catch (err) {
     console.warn(`[Telegram] Notification failed (non-fatal): ${err.message}`);
   }
+}
+
+async function sendTelegramAlert(score, title, socialPostText) {
+  const runTime = new Date().toUTCString();
+  const message =
+    `✅ *Automated Post Queued\\!*\n\n` +
+    `*🕐 Run Time:* ${escapeMd(runTime)}\n` +
+    `*AI Score:* ${score}\n` +
+    `*Source Article:* ${escapeMd(title)}\n\n` +
+    `*Generated Post:*\n${escapeMd(socialPostText)}`;
+  await sendTelegramMessage(message);
+}
+
+async function sendTelegramThresholdAlert(topScore, threshold) {
+  const runTime = new Date().toUTCString();
+  const message =
+    `⚠️ *AutoRSS: No articles passed the threshold\\!*\n\n` +
+    `*🕐 Run Time:* ${escapeMd(runTime)}\n` +
+    `*Threshold:* ${threshold}\n` +
+    `*Highest score this run:* ${topScore}\n\n` +
+    `_No post was published\\. Consider lowering POSTING\\_THRESHOLD if this keeps happening\\._`;
+  await sendTelegramMessage(message);
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -291,6 +305,7 @@ async function main() {
       `[Filter] No articles passed threshold ${POSTING_THRESHOLD}. ` +
       `Highest score was ${topScore}. Exiting.`
     );
+    await sendTelegramThresholdAlert(topScore, POSTING_THRESHOLD);
     process.exit(0);
   }
 
