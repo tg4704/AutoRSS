@@ -114,13 +114,50 @@ async function scoreArticles(articles) {
     })
     .join('\n\n');
 
-  const prompt = `You are an expert social media curator specializing in: ${SCORING_CRITERIA}
+  const prompt = `You are a creative social media writer for an audience that loves science, tech, and engineering. Your niche: ${SCORING_CRITERIA}
 
-Evaluate each article below independently against that niche. For every article, output:
-• id          – copy the exact integer ID shown for the article you are scoring
-• score       – relevance, viral potential, and audience value on a strict 0–100 integer scale
-• reasoning   – one concise sentence explaining the score
-• social_post_text – a compelling social media post strictly under 240 characters that summarises or reacts to the news, with natural relevant keywords (not spammy). A source link will be appended automatically, so do NOT include any URL and leave room for it.
+━━━ SCORING ━━━
+For each article output:
+• id       – the exact integer ID shown
+• score    – 0 to 100 (relevance + viral potential + audience value)
+• reasoning – one sentence explaining the score
+
+━━━ WRITING THE POST (social_post_text) ━━━
+Write a post strictly under 240 characters. A link may be appended after, so do NOT include any URL.
+
+STRICT RULES — break any of these and the post is rejected:
+1. ZERO em dashes (— or –). Never use them. Use a comma, a period, or a line break instead.
+2. No repetition. Do not restate the headline. Add something new: context, a question, a comparison, a surprise.
+3. Simple everyday language. Write like you are texting a smart friend, not writing a press release.
+4. Make the audience feel something: curious, surprised, amused, or slightly mind-blown.
+5. End with either a question the audience can actually answer, or a line that makes them stop and think.
+6. No hashtags. No "Breaking:" or "NEW:" prefixes. No filler like "Fascinating!" or "Wow!" as standalone words.
+
+WRITING STYLES — you have 6 styles. Pick ONE randomly per article. Vary across the batch (do not use the same style twice in a row):
+
+STYLE 1 — The Everyday Analogy
+  Hook: connect the science/tech to something people use daily.
+  Example feel: "Your phone charger does X billion times less work than what these researchers just built inside a chip the size of a fingernail. How is that even possible?"
+
+STYLE 2 — The Myth Flip
+  Hook: start by stating what people wrongly believe, then flip it.
+  Example feel: "We always assumed X was impossible at small scales. Turns out we were just measuring the wrong thing. What else are we getting wrong?"
+
+STYLE 3 — The Surprising Number
+  Hook: lead with a specific number or stat that sounds unbelievable.
+  Example feel: "68% of new cloud workloads run serverless now. That means the server you imagined is probably not running your favourite app anymore."
+
+STYLE 4 — The Tiny Story
+  Hook: put the reader inside the moment with 1-2 vivid sentences, then land the point.
+  Example feel: "A briefcase-sized satellite tumbles in orbit. It fires two thrusters at once, one chemical, one electric, and pulls off a manoeuvre that should have been impossible for something that small."
+
+STYLE 5 — The Direct Question
+  Hook: open cold with a question that is impossible to scroll past.
+  Example feel: "What if the thing slowing down AI was not the model, but the memory chip sitting next to it? That is exactly what this new architecture fixes."
+
+STYLE 6 — The Relatable Comparison
+  Hook: compare the discovery to something from daily life so the scale or concept clicks instantly.
+  Example feel: "Imagine your WiFi router could think. Not smart-home think. Actually reason, adapt, and reroute itself mid-packet. That is roughly what this chip does, at 10 gigabits per second."
 
 Return ONLY a valid JSON array. No markdown, no extra text. Schema:
 [
@@ -129,7 +166,7 @@ Return ONLY a valid JSON array. No markdown, no extra text. Schema:
     "title": "Original Article Title",
     "score": 85,
     "reasoning": "Brief evaluation note.",
-    "social_post_text": "Engaging post under 240 chars."
+    "social_post_text": "Post under 240 chars, no URL, no em dash."
   }
 ]
 
@@ -314,9 +351,13 @@ async function main() {
   // Recover the original feed item so we can append its source link and dedup it.
   const original = resolveOriginal(winner, fresh);
   const sourceLink = original?.link ?? '';
-  const postText = sourceLink
+  // Randomly include the source link ~60% of the time so posts don't look
+  // identical in structure every run. When skipped the post stands on its own.
+  const shouldAppendLink = sourceLink && Math.random() < 0.6;
+  const postText = shouldAppendLink
     ? `${winner.social_post_text}\n\n${sourceLink}`
     : winner.social_post_text;
+  console.log(`[Filter] Link appended: ${shouldAppendLink ? 'yes' : 'no (randomly skipped)'}`);
 
   console.log(`[Filter] Winner: "${winner.title}"`);
   console.log(`[Filter] Score:  ${winner.score}`);
