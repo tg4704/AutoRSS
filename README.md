@@ -38,7 +38,7 @@ A lightweight, serverless Node.js automation script that runs on a scheduled Git
 │                                                                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ┌─────────────┐  │
 │  │  RSS Parser  │─▶│ Time Filter  │─▶│  Dedup   │─▶│ Gemini 3.5  │  │
-│  │ (multi-feed) │  │  (118 min)   │  │(posted   │  │ Flash AI    │  │
+│  │ (multi-feed) │  │  (4 hours)   │  │(posted   │  │ Flash AI    │  │
 │  └──────────────┘  └──────────────┘  │ .json)   │  │(score+post) │  │
 │                                       └──────────┘  └──────┬──────┘  │
 │                                                            │         │
@@ -135,7 +135,7 @@ keep item if: new Date(item.isoDate ?? item.pubDate).getTime() >= cutoff
 
 The script prefers `isoDate` over `pubDate` because `isoDate` is already normalised to ISO 8601 by `rss-parser` and parses reliably. Items with no parseable date field are **discarded silently**.
 
-The 118-minute window is intentionally 2 minutes shorter than the 2-hour cron interval. This small buffer guards against edge cases where GitHub Actions delays the run slightly past the scheduled time — ensuring a fresh article published just before the previous run is not accidentally re-picked by a late-firing subsequent run.
+The 4-hour window is intentionally wider than the 2-hour trigger interval. Because the external scheduler (cron-job.org) is reliable but not perfectly guaranteed, this window ensures a missed trigger does not silently drop articles — the next run will catch up on the full gap. Duplicate posting is prevented by the deduplication layer (`posted.json`), not by the time window, so widening it carries no risk of reposts.
 
 If the filtered array is empty after this pass, the script logs a message and calls `process.exit(0)` — a clean exit that GitHub Actions records as a success, not a failure.
 
@@ -332,15 +332,54 @@ major protocol upgrades, and significant on-chain data findings. Score down pric
 ### Trigger Configuration
 ```yaml
 on:
-  schedule:
-    - cron: '0 */2 * * *'
-  workflow_dispatch:
+  workflow_dispatch:   # Triggered externally by cron-job.org every 2 hours
 ```
 
-- `schedule` runs the job at minute 0 of every even-numbered UTC hour: 00:00, 02:00, 04:00, …, 22:00.
-- `workflow_dispatch` adds a "Run workflow" button in the GitHub Actions UI, allowing manual one-off executions without pushing a commit.
+The workflow is triggered exclusively via `workflow_dispatch` — a GitHub API event fired by an external scheduler (cron-job.org) every 2 hours. This replaces GitHub's built-in `schedule` trigger, which is unreliable on the free tier (runs are often delayed 5–30 minutes or skipped entirely under platform load).
 
-> **Important:** GitHub does not guarantee cron jobs fire at the exact scheduled second. Under high load, runs can be delayed by several minutes. The 118-minute filter window accounts for this with a 2-minute buffer.
+GitHub's built-in `schedule` was removed because:
+1. It fires at peak load times (top-of-the-hour) causing delays and outright skips
+2. Skipped runs meant articles in that gap were permanently missed
+3. There is no retry mechanism — GitHub simply drops the missed run
+
+The external dispatcher (`cron-job.org`) fires within seconds of the scheduled time, every time, and provides a per-execution history log with HTTP response codes so you can confirm each trigger landed.
+
+> **Note:** `workflow_dispatch` also adds a **"Run workflow"** button in the GitHub Actions UI for manual one-off executions without pushing a commit.
+
+### External Scheduler Setup (cron-job.org)
+
+1. Create a free account at [cron-job.org](https://cron-job.org)
+2. Create a GitHub **Fine-grained Personal Access Token** at `github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens`:
+   - Repository access: `AutoRSS` only
+   - Permissions → Actions: `Read and Write`
+3. In cron-job.org, create a new cron job with these settings:
+
+| Field | Value |
+|---|---|
+| URL | `https://api.github.com/repos/YOUR_USERNAME/AutoRSS/actions/workflows/cron-job.yml/dispatches` |
+| Method | `POST` |
+| Schedule | Every 2 hours |
+| Header 1 | `Authorization: Bearer YOUR_PAT_TOKEN` |
+| Header 2 | `Content-Type: application/json` |
+| Request body | `{"ref":"main"}` |
+
+4. Save — cron-job.org will POST to GitHub every 2 hours; GitHub fires `workflow_dispatch` and the run starts within seconds.
+
+**Verify it works:** After the first trigger, you should see a `204 No Content` response in cron-job.org's History tab and a new run appear in GitHub Actions almost immediately. You can also test it manually from PowerShell:
+```powershell
+$headers = @{
+  "Authorization" = "Bearer YOUR_PAT_TOKEN"
+  "Accept"        = "application/vnd.github+json"
+  "Content-Type"  = "application/json"
+}
+Invoke-RestMethod -Method Post `
+  -Uri "https://api.github.com/repos/YOUR_USERNAME/AutoRSS/actions/workflows/cron-job.yml/dispatches" `
+  -Headers $headers `
+  -Body '{"ref":"main"}'
+```
+No output = success (`204`). A new run appears in Actions within seconds.
+
+> **Important:** Do not test this URL by visiting it in a browser — browsers send GET requests (unauthenticated), which always return `404 Not Found`. The endpoint only accepts authenticated POST requests.
 
 ### Job Configuration
 ```yaml
@@ -387,7 +426,7 @@ The script uses a layered error model:
 |---|---|---|
 | Individual RSS feed | Network error, malformed XML | Logs error, skips that feed, continues with others |
 | All RSS feeds | Every feed returns empty or fails | Exits with code 0 after logging — not a workflow failure |
-| No recent articles | All articles older than 118 min | Exits with code 0 — expected quiet run |
+| No recent articles | All articles older than 4 hours | Exits with code 0 — expected quiet run |
 | Gemini API | Network error, malformed JSON response | Exits with code 1 — workflow run marked as failed; prompts investigation |
 | No articles pass threshold | All scores below threshold | Exits with code 0 — expected run, not an error |
 | Buffer API (single channel) | GraphQL error, MutationError, network error | Logs error, continues to next channel ID |
@@ -431,10 +470,10 @@ Navigate to your repo → **Settings** → **Secrets and variables** → **Actio
 
 Add all eight secrets listed in the [Environment Variables Reference](#environment-variables-reference) table.
 
-### Step 5 — Enable GitHub Actions
-If Actions is not already enabled on the repository, go to the **Actions** tab and click the enable button.
+### Step 5 — Set up cron-job.org as the external scheduler
+Follow the [External Scheduler Setup](#external-scheduler-setup-cron-joborg) instructions above to configure cron-job.org to trigger the workflow every 2 hours.
 
-The workflow will fire automatically at the next scheduled time. To test immediately, go to **Actions** → **AutoRSS Feed Processor** → **Run workflow**.
+To test immediately before the first scheduled trigger, go to **Actions** → **AutoRSS Feed Processor** → **Run workflow**.
 
 ---
 
@@ -476,11 +515,9 @@ To test without actually posting to Buffer or sending a Telegram message, tempor
 
 ## Limitations & Known Behaviours
 
-- **GitHub Actions cron is UTC.** The `0 */2 * * *` schedule fires at UTC midnight, 02:00 UTC, 04:00 UTC, etc. If your audience is in a specific timezone, adjust the cron expression accordingly.
+- **Scheduling is driven by cron-job.org, not GitHub's built-in cron.** The workflow uses `workflow_dispatch` only. cron-job.org fires the trigger every 2 hours reliably; if it goes down, no runs fire until it recovers. Monitor cron-job.org's History tab to confirm each trigger lands. The 4-hour fetch window means a single missed trigger is self-healing — the next run catches up on the gap without reposting (dedup handles that).
 
-- **GitHub Actions cron is not guaranteed to fire on time.** Under heavy platform load, runs may be delayed by several minutes. The 118-minute filter window provides a 2-minute buffer but cannot account for delays longer than that.
-
-- **GitHub Actions disables scheduled workflows on inactive repositories.** If no commits are pushed to the repository for 60 days, GitHub pauses cron triggers. Keep the repo active or use `workflow_dispatch` periodically.
+- **GitHub disables `workflow_dispatch` on inactive repositories.** If no commits are pushed and no runs are triggered for 60 days, GitHub may pause the workflow. cron-job.org's regular triggers count as activity and should prevent this.
 
 - **One post per run, not per matching article.** Even if five articles pass the scoring threshold, only the single highest-scoring article is published. This is by design to avoid flooding social channels.
 
