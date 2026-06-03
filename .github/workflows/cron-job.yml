@@ -1,9 +1,8 @@
 name: AutoRSS Feed Processor
 
 on:
-  schedule:
-    - cron: '0 */2 * * *'   # Every 2 hours on the hour
-  workflow_dispatch:          # Allow manual trigger from the GitHub UI
+  workflow_dispatch:          # Triggered externally by cron-job.org every 2 hours
+                              # (more reliable than GitHub's built-in schedule)
 
 # Never let two runs overlap — protects the posted.json commit-back from racing.
 concurrency:

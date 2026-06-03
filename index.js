@@ -13,7 +13,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
 const BUFFER_GRAPHQL_URL = 'https://api.buffer.com/graphql';
-const MAX_AGE_MS = 118 * 60 * 1000; // 1 hour 58 minutes
+// Wide enough to absorb GitHub's delayed/skipped scheduled runs. Dedup
+// (posted.json) prevents the overlap from ever causing a repost.
+const MAX_AGE_MS = 240 * 60 * 1000; // 4 hours
 const SNIPPET_MAX_CHARS = 400;
 
 // Deduplication: keys of already-posted articles are persisted between runs so
@@ -251,7 +253,7 @@ async function main() {
   }
 
   if (articles.length === 0) {
-    console.log('[RSS] No articles published within the last 118 minutes. Exiting.');
+    console.log('[RSS] No articles published within the last 4 hours. Exiting.');
     process.exit(0);
   }
 
