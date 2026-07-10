@@ -1,6 +1,7 @@
 import Parser from 'rss-parser';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { readFile, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 const RSS_FEEDS          = process.env.RSS_FEEDS;
@@ -14,9 +15,19 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
 const BUFFER_GRAPHQL_URL = 'https://api.buffer.com/graphql';
 
-// Wide enough to absorb missed/delayed external triggers. Dedup prevents reposts.
-const MAX_AGE_MS = 240 * 60 * 1000; // 4 hours
+// The brand posts twice a day (11:00 & 17:00 IST). The longest gap between runs is
+// 18 hours (17:00 → 11:00 next day), so the window must span it or the morning run would
+// miss everything published overnight. 20h adds margin for a delayed/missed trigger.
+// Dedup (posted.json) prevents reposts, so re-surfacing already-seen articles is harmless.
+const MAX_AGE_MS = 20 * 60 * 60 * 1000; // 20 hours
 const SNIPPET_MAX_CHARS = 400;
+
+// Platforms we generate distinct content for. Buffer `service` strings are mapped onto
+// these keys at runtime (see resolvePlatformChannels).
+const SUPPORTED_PLATFORMS = ['threads', 'x', 'bluesky'];
+
+// Per-platform character budgets for the main post (advisory — enforced via the prompt).
+const PLATFORM_LIMITS = { threads: 500, x: 280, bluesky: 300 };
 
 // Gemini resilience: try the primary model, fall back to a second model, and
 // retry transient errors (503 overload, 429 rate limit, 500) with backoff.
@@ -233,50 +244,17 @@ async function scoreArticles(articles) {
     })
     .join('\n\n');
 
-  const prompt = `You are a creative social media writer for an audience that loves science, tech, and engineering. Your niche: ${SCORING_CRITERIA}
+  const prompt = `You are a sharp editor curating articles for an audience that loves science, tech, and engineering. Your niche: ${SCORING_CRITERIA}
 
 ━━━ SCORING ━━━
+Score every article on how well it would perform as a short social post for this audience.
+Judge on: relevance to the niche, viral potential, and genuine value/surprise for the reader.
+
 For each article output:
 • id        – the exact integer ID shown
-• score     – 0 to 100 (relevance + viral potential + audience value)
+• title     – the original article title, echoed back verbatim
+• score     – integer 0 to 100
 • reasoning – one sentence explaining the score
-
-━━━ WRITING THE POST (social_post_text) ━━━
-Write a post strictly under 240 characters. Do NOT include any URL.
-
-STRICT RULES — break any of these and the post is rejected:
-1. ZERO em dashes (— or –). Never use them. Use a comma, a period, or a line break instead.
-2. No repetition. Do not restate the headline. Add something new: context, a question, a comparison, a surprise.
-3. Simple everyday language. Write like you are texting a smart friend, not writing a press release.
-4. Make the audience feel something: curious, surprised, amused, or slightly mind-blown.
-5. End with either a question the audience can actually answer, or a line that makes them stop and think.
-6. No hashtags. No "Breaking:" or "NEW:" prefixes. No filler like "Fascinating!" or "Wow!" as standalone words.
-
-WRITING STYLES — you have 6 styles. Pick ONE randomly per article. Vary across the batch (do not use the same style twice in a row):
-
-STYLE 1 — The Everyday Analogy
-  Hook: connect the science/tech to something people use daily.
-  Example feel: "Your phone charger does X billion times less work than what these researchers just built inside a chip the size of a fingernail. How is that even possible?"
-
-STYLE 2 — The Myth Flip
-  Hook: start by stating what people wrongly believe, then flip it.
-  Example feel: "We always assumed X was impossible at small scales. Turns out we were just measuring the wrong thing. What else are we getting wrong?"
-
-STYLE 3 — The Surprising Number
-  Hook: lead with a specific number or stat that sounds unbelievable.
-  Example feel: "68% of new cloud workloads run serverless now. That means the server you imagined is probably not running your favourite app anymore."
-
-STYLE 4 — The Tiny Story
-  Hook: put the reader inside the moment with 1-2 vivid sentences, then land the point.
-  Example feel: "A briefcase-sized satellite tumbles in orbit. It fires two thrusters at once, one chemical, one electric, and pulls off a manoeuvre that should have been impossible for something that small."
-
-STYLE 5 — The Direct Question
-  Hook: open cold with a question that is impossible to scroll past.
-  Example feel: "What if the thing slowing down AI was not the model, but the memory chip sitting next to it? That is exactly what this new architecture fixes."
-
-STYLE 6 — The Relatable Comparison
-  Hook: compare the discovery to something from daily life so the scale or concept clicks instantly.
-  Example feel: "Imagine your WiFi router could think. Not smart-home think. Actually reason, adapt, and reroute itself mid-packet. That is roughly what this chip does, at 10 gigabits per second."
 
 Return ONLY a valid JSON array. No markdown, no extra text. Schema:
 [
@@ -284,8 +262,7 @@ Return ONLY a valid JSON array. No markdown, no extra text. Schema:
     "id": 0,
     "title": "Original Article Title",
     "score": 85,
-    "reasoning": "Brief evaluation note.",
-    "social_post_text": "Post under 240 chars, no URL, no em dash."
+    "reasoning": "Brief evaluation note."
   }
 ]
 
@@ -294,6 +271,161 @@ ${articlesPayload}`;
 
   const rawText = await generateWithRetry(prompt);
   return JSON.parse(rawText);
+}
+
+// ── Step 3b: Write per-platform posts for the winning article ─────────────────
+// One Gemini call for the single winner. Produces a distinct main post per platform plus
+// optional follow-up replies (posted manually by the operator). The model NEVER emits URLs
+// — link placement is owned by the code (see applyLinks) to avoid URL hallucination.
+function buildWriterPrompt(original, platforms, hasSourceLink) {
+  const snippet = (original.contentSnippet ?? original.summary ?? '')
+    .slice(0, SNIPPET_MAX_CHARS)
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const platformSpecs = platforms.map((p) => {
+    if (p === 'threads') {
+      return `- threads: main_post max ${PLATFORM_LIMITS.threads} chars. Front-load the strongest line (Threads truncates after ~4 lines). "replies" is usually an empty array; add one only if there is a genuine follow-up thought.`;
+    }
+    if (p === 'x') {
+      return `- x: main_post max ${PLATFORM_LIMITS.x} chars, NO link. "replies" must contain exactly ONE short lead-in sentence (the source link is attached to it automatically afterward), e.g. "Full breakdown here:" or "Source and the full numbers:".`;
+    }
+    if (p === 'bluesky') {
+      return `- bluesky: write natively, do NOT reuse the Threads/X wording verbatim even if the angle is the same. Each post max ${PLATFORM_LIMITS.bluesky} chars. If the article supports it, prefer a thread: put continuation posts in "replies" (1 to 2 entries). Otherwise leave "replies" empty.`;
+    }
+    return `- ${p}: main_post is a concise standalone post.`;
+  }).join('\n');
+
+  const platformSchema = platforms
+    .map((p) => `    "${p}": { "main_post": "...", "replies": [] }`)
+    .join(',\n');
+
+  return `You are the content voice for Substrata, a faceless science and engineering brand. Turn ONE article into short social posts that read like a real person reacting to something surprising, not like a news-summary bot.
+
+ARTICLE
+Title:   ${original.title ?? 'N/A'}
+Summary: ${snippet || 'N/A'}
+
+STEP 1 — FIND THE TENSION
+Pick exactly ONE angle, whichever is strongest, and commit to it (do not summarize the whole article):
+- A number or fact that contradicts a common assumption
+- A detail that raises an unanswered question the article itself does not fully resolve
+- A comparison that makes the scale of something click (age, size, speed, cost)
+
+STEP 2 — WRITE THE HOOK
+BANNED openings — never use these regardless of fit:
+- "Imagine [X]..."
+- "We always assumed [X], but..."
+- "What if [X]?"
+- Any rhetorical question with an obvious one-word answer
+Use ONE of these structures instead, and rotate so the platforms do not all use the same one:
+- A flat, confident claim stated as fact, then let the surprising detail land in the next sentence
+- A specific number stated cold with no setup, then why it matters
+- A direct address to the reader's intuition ("Your gut says X. It's wrong.")
+- An incomplete thought that invites someone to finish it or push back
+End with a genuine invitation to respond that connects specifically to your claim (ask what is missing, ask them to guess before revealing, or take a mild stance someone could disagree with). Do not tack on a generic "what do you think".
+
+STRICT RULES — break any and the post is rejected:
+1. ZERO em dashes (— or –). Use a comma, a period, or a line break.
+2. Do not restate the headline. Add something new: context, a question, a comparison, a surprise.
+3. Simple everyday language, like texting a smart friend, not a press release.
+4. Make the reader feel something: curious, surprised, amused, or slightly mind-blown.
+5. No hashtags. No "Breaking:"/"NEW:" prefixes. No standalone filler like "Fascinating!" or "Wow!".
+6. Put NO URLs or links in ANY field. The system attaches the source link automatically where it belongs.${hasSourceLink ? '' : '\n7. No source link is available for this article, so do NOT reference "the link", "source below", or "read more" anywhere.'}
+
+STEP 3 — ADAPT TO EACH PLATFORM
+${platformSpecs}
+
+The main_post for every platform must read as COMPLETE on its own, because replies may not be posted. Replies are genuine follow-ups, never essential context.
+
+STEP 4 — IMAGE
+Provide "image_description": a single vivid one-line prompt for an AI-generated image that fits the post, used only if the article has no usable hero image.
+
+OUTPUT — strict JSON, no markdown, no preamble. Include ONLY these platform keys: ${platforms.join(', ')}.
+{
+  "angle_chosen": "one line naming the single angle you committed to",
+  "image_description": "one-line AI image generation prompt",
+  "platforms": {
+${platformSchema}
+  }
+}`;
+}
+
+async function writePlatformPosts(original, platforms, hasSourceLink) {
+  const prompt  = buildWriterPrompt(original, platforms, hasSourceLink);
+  const rawText = await generateWithRetry(prompt);
+  const parsed  = JSON.parse(rawText);
+  if (!parsed || typeof parsed.platforms !== 'object') {
+    throw new Error('Writer response missing "platforms" object.');
+  }
+  return parsed;
+}
+
+// ── Buffer helpers: shared GraphQL + channel→platform resolution ──────────────
+async function bufferGraphQL(query, variables = {}) {
+  const response = await fetch(BUFFER_GRAPHQL_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization:  `Bearer ${BUFFER_API_KEY}`,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await response.json();
+  if (json.errors?.length) {
+    throw new Error(`Buffer GraphQL error: ${JSON.stringify(json.errors)}`);
+  }
+  return json.data;
+}
+
+// Buffer's `service` string → our platform key. Twitter is exposed as "twitter";
+// we also accept "x" defensively in case Buffer ever renames it.
+function serviceToPlatform(service) {
+  const s = String(service ?? '').toLowerCase();
+  if (s === 'twitter' || s === 'x') return 'x';
+  if (s === 'threads')              return 'threads';
+  if (s === 'bluesky')              return 'bluesky';
+  return null; // unsupported service (e.g. mastodon, linkedin) — skipped
+}
+
+// Resolve the configured BUFFER_CHANNEL_IDS into a { platform: channelId } map by asking
+// Buffer which social service each channel belongs to. No labeled env var needed.
+async function resolvePlatformChannels(channelIds) {
+  const data    = await bufferGraphQL(`{ account { organizations { id } } }`);
+  const orgs    = data?.account?.organizations ?? [];
+  if (orgs.length === 0) throw new Error('Buffer returned no organizations for this API key.');
+
+  // Gather channels across all orgs so we can look up any configured ID.
+  const idToService = new Map();
+  for (const org of orgs) {
+    const chData = await bufferGraphQL(
+      `query Channels($input: ChannelsInput!) { channels(input: $input) { id name service } }`,
+      { input: { organizationId: org.id } }
+    );
+    for (const ch of chData?.channels ?? []) {
+      idToService.set(ch.id, ch.service);
+    }
+  }
+
+  const platformChannels = {};
+  for (const id of channelIds) {
+    const service  = idToService.get(id);
+    const platform = serviceToPlatform(service);
+    if (!platform) {
+      console.warn(
+        `[Buffer] Channel ${id} → service "${service ?? 'unknown'}" is not a supported ` +
+        `platform (${SUPPORTED_PLATFORMS.join('/')}). Skipping.`
+      );
+      continue;
+    }
+    if (platformChannels[platform]) {
+      console.warn(`[Buffer] Multiple channels map to "${platform}"; keeping the first.`);
+      continue;
+    }
+    platformChannels[platform] = id;
+    console.log(`[Buffer] Channel ${id} → platform "${platform}".`);
+  }
+  return platformChannels;
 }
 
 // ── Step 4: Post to Buffer via GraphQL ────────────────────────────────────────
@@ -354,6 +486,61 @@ async function postToBuffer(channelId, text) {
   return false;
 }
 
+// ── Link placement (code owns URLs; the LLM never emits them) ─────────────────
+// Given the winner's link (or '' for JC / no-link), attach it per platform rules and
+// return { mainPost, replies } ready for posting/delivery.
+function applyLinks(platform, content, link) {
+  const mainPost = String(content?.main_post ?? '').trim();
+  const replies  = Array.isArray(content?.replies)
+    ? content.replies.map((r) => String(r).trim()).filter(Boolean)
+    : [];
+
+  if (!link) return { mainPost, replies };
+
+  if (platform === 'threads') {
+    return { mainPost: `${mainPost}\n\n${link}`, replies };
+  }
+  if (platform === 'x') {
+    // Link rides in the reply so the main tweet stays clean. Guarantee a reply exists.
+    const lead = replies[0] ? `${replies[0]}\n${link}` : link;
+    return { mainPost, replies: [lead, ...replies.slice(1)] };
+  }
+  if (platform === 'bluesky') {
+    // Link goes on the last thread post; if there's no thread, the main post stays link-free.
+    if (replies.length === 0) return { mainPost, replies };
+    const last = `${replies[replies.length - 1]}\n${link}`;
+    return { mainPost, replies: [...replies.slice(0, -1), last] };
+  }
+  return { mainPost, replies };
+}
+
+// ── Hero image scraping (og:image / twitter:image) ────────────────────────────
+async function scrapeHeroImage(articleUrl) {
+  if (!articleUrl) return null;
+  try {
+    const res = await fetch(articleUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AutoRSS/1.0; +https://github.com/tg4704/AutoRSS)' },
+      signal:  AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const patterns = [
+      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+      /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m?.[1]) return m[1].trim();
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[Image] Hero-image scrape failed (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
 // ── Step 5: Telegram notifications ───────────────────────────────────────────
 const escapeMd = (str) => String(str).replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
 
@@ -367,6 +554,7 @@ async function sendTelegramMessage(message) {
         chat_id:    TELEGRAM_CHAT_ID,
         text:       message,
         parse_mode: 'MarkdownV2',
+        link_preview_options: { is_disabled: true },
       }),
     });
     const json = await res.json();
@@ -380,19 +568,66 @@ async function sendTelegramMessage(message) {
   }
 }
 
-// Success alert — includes a JC badge line when the winner came from the JC feed
-async function sendTelegramAlert(score, title, socialPostText, jcNumber = null) {
+async function sendTelegramPhoto(photoUrl, caption) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`;
+  try {
+    const res  = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        chat_id:    TELEGRAM_CHAT_ID,
+        photo:      photoUrl,
+        caption:    caption ? caption.slice(0, 1024) : undefined,
+      }),
+    });
+    const json = await res.json();
+    if (json.ok) {
+      console.log('[Telegram] Hero image sent.');
+      return true;
+    }
+    console.warn(`[Telegram] Photo send failed (non-fatal): ${json.description}`);
+    return false;
+  } catch (err) {
+    console.warn(`[Telegram] Photo send failed (non-fatal): ${err.message}`);
+    return false;
+  }
+}
+
+// Per-platform digest: shows what was auto-posted (main post) plus the replies the operator
+// posts manually, the angle, and either confirmation the hero image was sent or an AI image
+// generation prompt when no hero image exists.
+async function sendTelegramDigest({ score, title, angle, sourceLink, jcNumber, perPlatform, heroSent, imageDescription }) {
   const runTime = new Date().toUTCString();
-  const jcLine  = jcNumber != null
-    ? `*📖 JC Article:* \\#${jcNumber}\n`
-    : '';
+  const jcLine  = jcNumber != null ? `*📖 JC Article:* \\#${jcNumber}\n` : '';
+  const linkLine = sourceLink ? `*🔗 Source:* ${escapeMd(sourceLink)}\n` : '';
+
+  const blocks = perPlatform.map(({ platform, mainPost, replies }) => {
+    const label = platform.toUpperCase();
+    let block = `━━━ *${escapeMd(label)}* ━━━\n${escapeMd(mainPost)}`;
+    if (replies.length > 0) {
+      const replyLines = replies
+        .map((r, i) => `  ${i + 1}\\. ${escapeMd(r)}`)
+        .join('\n');
+      block += `\n\n_Reply${replies.length > 1 ? ' thread' : ''} to post manually:_\n${replyLines}`;
+    }
+    return block;
+  }).join('\n\n');
+
+  const imageLine = heroSent
+    ? `*🖼 Image:* hero image sent above — attach it to the post\\.`
+    : `*🖼 No hero image found\\. Generation prompt:*\n${escapeMd(imageDescription ?? 'N/A')}`;
+
   const message =
-    `✅ *Automated Post Queued\\!*\n\n` +
+    `✅ *Automated Post Published\\!*\n\n` +
     `*🕐 Run Time:* ${escapeMd(runTime)}\n` +
     jcLine +
     `*AI Score:* ${score}\n` +
-    `*Source Article:* ${escapeMd(title)}\n\n` +
-    `*Generated Post:*\n${escapeMd(socialPostText)}`;
+    `*Source Article:* ${escapeMd(title)}\n` +
+    (angle ? `*🎯 Angle:* ${escapeMd(angle)}\n` : '') +
+    linkLine +
+    `\n${blocks}\n\n` +
+    imageLine;
+
   await sendTelegramMessage(message);
 }
 
@@ -427,7 +662,7 @@ async function main() {
   }
 
   if (articles.length === 0) {
-    console.log('[RSS] No articles published within the last 4 hours. Exiting.');
+    console.log('[RSS] No articles published within the freshness window. Exiting.');
     process.exit(0);
   }
 
@@ -484,35 +719,72 @@ async function main() {
   const winner   = passing.reduce((best, curr) => (curr.score > best.score ? curr : best));
   const original = resolveOriginal(winner, pool);
 
+  if (!original) {
+    console.error('[Filter] Could not map the winning score back to a source article. Exiting.');
+    process.exit(1);
+  }
+
   // Detect whether the winner is a JC article
-  const isJC    = original?._isJC === true;
+  const isJC    = original._isJC === true;
   const jcNumber = isJC ? original._jcNumber : null;
 
-  // JC articles never get a link appended (per spec).
-  // Regular articles: append link ~60% of the time for variety.
-  const sourceLink      = original?.link ?? '';
-  const shouldAppendLink = !isJC && sourceLink && Math.random() < 0.6;
-  const postText        = shouldAppendLink
-    ? `${winner.social_post_text}\n\n${sourceLink}`
-    : winner.social_post_text;
+  // JC articles carry no shareable source link; regular articles do.
+  const sourceLink = isJC ? '' : (original.link ?? '');
 
-  console.log(`[Filter] Winner:       "${winner.title}"`);
-  console.log(`[Filter] Score:        ${winner.score}`);
-  console.log(`[Filter] Reason:       ${winner.reasoning}`);
-  console.log(`[Filter] JC article:   ${isJC ? `yes (#${jcNumber})` : 'no'}`);
-  console.log(`[Filter] Link appended:${shouldAppendLink ? ' yes' : ' no'}`);
-  console.log(`[Filter] Post:\n${postText}`);
+  console.log(`[Filter] Winner:     "${winner.title}"`);
+  console.log(`[Filter] Score:      ${winner.score}`);
+  console.log(`[Filter] Reason:     ${winner.reasoning}`);
+  console.log(`[Filter] JC article: ${isJC ? `yes (#${jcNumber})` : 'no'}`);
 
-  // ── 4. Dispatch to Buffer ──────────────────────────────────────────────────
+  // ── 3c. Resolve which Buffer channels map to which platforms ───────────────
   const channelIds = BUFFER_CHANNEL_IDS.split(',').map((id) => id.trim()).filter(Boolean);
+  let platformChannels;
+  try {
+    platformChannels = await resolvePlatformChannels(channelIds);
+  } catch (err) {
+    console.error('[Buffer] Fatal error resolving channel platforms:', err.message);
+    process.exit(1);
+  }
+  const platforms = SUPPORTED_PLATFORMS.filter((p) => platformChannels[p]);
+  if (platforms.length === 0) {
+    console.error('[Buffer] No configured channel resolved to a supported platform. Exiting.');
+    process.exit(1);
+  }
+  console.log(`[Buffer] Writing for platforms: ${platforms.join(', ')}`);
 
+  // ── 3d. Write per-platform content for the winner ──────────────────────────
+  let written;
+  try {
+    written = await writePlatformPosts(original, platforms, Boolean(sourceLink));
+  } catch (err) {
+    console.error('[Gemini] Fatal error during per-platform writing:', err.message);
+    process.exit(1);
+  }
+  console.log(`[Gemini] Angle chosen: ${written.angle_chosen ?? 'N/A'}`);
+
+  // Assemble per-platform posts with links placed by code.
+  const perPlatform = platforms.map((platform) => {
+    const { mainPost, replies } = applyLinks(platform, written.platforms?.[platform], sourceLink);
+    return { platform, channelId: platformChannels[platform], mainPost, replies };
+  });
+
+  for (const p of perPlatform) {
+    console.log(`[Post] ${p.platform} main:\n${p.mainPost}`);
+    if (p.replies.length) console.log(`[Post] ${p.platform} replies (manual): ${p.replies.length}`);
+  }
+
+  // ── 4. Dispatch main posts to Buffer (one per platform; replies are manual) ─
   let anySuccess = false;
-  for (const channelId of channelIds) {
+  for (const { platform, channelId, mainPost } of perPlatform) {
+    if (!mainPost) {
+      console.warn(`[Buffer] No main post generated for ${platform}; skipping.`);
+      continue;
+    }
     try {
-      const ok = await postToBuffer(channelId, postText);
+      const ok = await postToBuffer(channelId, mainPost);
       if (ok) anySuccess = true;
     } catch (err) {
-      console.error(`[Buffer] Error posting to channel ${channelId}: ${err.message}`);
+      console.error(`[Buffer] Error posting to ${platform} (${channelId}): ${err.message}`);
     }
   }
 
@@ -530,11 +802,29 @@ async function main() {
     console.warn('[Buffer] No channel accepted the post — not recording in history.');
   }
 
-  // ── 5. Telegram alert ──────────────────────────────────────────────────────
-  await sendTelegramAlert(winner.score, winner.title, postText, jcNumber);
+  // ── 5. Hero image + Telegram digest ────────────────────────────────────────
+  const heroUrl  = sourceLink ? await scrapeHeroImage(sourceLink) : null;
+  const heroSent = heroUrl ? await sendTelegramPhoto(heroUrl, winner.title) : false;
+
+  await sendTelegramDigest({
+    score:            winner.score,
+    title:            winner.title,
+    angle:            written.angle_chosen,
+    sourceLink,
+    jcNumber,
+    perPlatform,
+    heroSent,
+    imageDescription: written.image_description,
+  });
 
   console.log(`[${new Date().toISOString()}] AutoRSS run completed.`);
   process.exit(0);
 }
 
-main();
+// Run only when executed directly (`node index.js`), not when imported (e.g. by tests).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}
+
+// Exported for unit testing of the pure helpers.
+export { applyLinks, serviceToPlatform, buildWriterPrompt };

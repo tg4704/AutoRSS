@@ -1,8 +1,9 @@
 name: AutoRSS Feed Processor
 
 on:
-  workflow_dispatch:          # Triggered externally by cron-job.org every 2 hours
-                              # (more reliable than GitHub's built-in schedule)
+  workflow_dispatch:          # Triggered externally by cron-job.org twice a day
+                              # (05:30 & 11:30 UTC = 11:00 & 17:00 IST).
+                              # More reliable than GitHub's built-in schedule.
 
 # Never let two runs overlap — protects the posted.json commit-back from racing.
 concurrency:
@@ -12,7 +13,9 @@ concurrency:
 jobs:
   run-autorss:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 35 min ceiling leaves room for the in-job retry loop (up to two 10-min waits) on top
+    # of a normal ~1-2 min run.
+    timeout-minutes: 35
 
     # Required so the workflow can commit the updated posted.json back to the repo.
     permissions:
@@ -41,8 +44,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Retry the whole run up to 3 times, waiting 10 minutes between attempts, so a
+      # transient outage (e.g. Gemini API down → nothing posted) recovers on its own.
+      # A normal run succeeds on the first attempt and never sleeps. Dedup (posted.json is
+      # written to disk mid-run and re-read on each attempt) prevents double-posting.
       - name: Run AutoRSS script
-        run: node index.js
+        run: |
+          for attempt in 1 2 3; do
+            echo "=== AutoRSS attempt $attempt ==="
+            if node index.js; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Attempt $attempt failed; waiting 10 minutes before retry..."
+              sleep 600
+            fi
+          done
+          echo "All attempts failed."
+          exit 1
 
       - name: Persist posted history
         if: always()

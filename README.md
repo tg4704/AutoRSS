@@ -1,6 +1,8 @@
 # AutoRSS — Automated RSS-to-Social Publishing Pipeline
 
-A lightweight, serverless Node.js automation script that runs on a scheduled GitHub Actions workflow. It fetches RSS feed content, scores it with Google Gemini AI, publishes the top-scoring article (with its source link) to social media via Buffer, and delivers a confirmation alert via Telegram.
+A lightweight, serverless Node.js automation script that runs on a scheduled GitHub Actions workflow. It fetches RSS feed content, scores it with Google Gemini AI, writes **platform-specific** posts for the top-scoring article, publishes the **main post** to each connected platform via Buffer, and delivers a Telegram digest containing the article's hero image (or an AI image-generation prompt) plus any **reply/thread follow-ups for you to post manually**.
+
+**Cadence:** the brand posts **twice a day — 11:00 & 17:00 IST (05:30 & 11:30 UTC)**. The main post always stands on its own, so skipping the manual replies loses nothing essential.
 
 ---
 
@@ -29,7 +31,7 @@ A lightweight, serverless Node.js automation script that runs on a scheduled Git
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        GitHub Actions Cron                          │
-│                         (every 2 hours)                             │
+│              (twice a day — 05:30 & 11:30 UTC)                       │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │  triggers
                                ▼
@@ -37,30 +39,37 @@ A lightweight, serverless Node.js automation script that runs on a scheduled Git
 │                          index.js  (Node 24)                        │
 │                                                                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ┌─────────────┐  │
-│  │  RSS Parser  │─▶│ Time Filter  │─▶│  Dedup   │─▶│ Gemini 3.5  │  │
-│  │ (multi-feed) │  │  (4 hours)   │  │(posted   │  │ Flash AI    │  │
-│  └──────────────┘  └──────────────┘  │ .json)   │  │(score+post) │  │
+│  │  RSS Parser  │─▶│ Time Filter  │─▶│  Dedup   │─▶│  Gemini     │  │
+│  │ (multi-feed) │  │  (20 hours)  │  │(posted   │  │  SCORE call │  │
+│  └──────────────┘  └──────────────┘  │ .json)   │  │ (all items) │  │
 │                                       └──────────┘  └──────┬──────┘  │
 │                                                            │         │
 │                                          ┌─────────────────▼──────┐  │
 │                                          │  Threshold Filter      │  │
 │                                          │  + Winner Selection    │  │
-│                                          │  + append source link  │  │
 │                                          └───────────┬────────────┘  │
+│                                                      │              │
+│                          ┌───────────────────────────▼────────────┐ │
+│                          │  Gemini WRITE call (winner only)        │ │
+│                          │  → per-platform main post + replies     │ │
+│                          │  Buffer service lookup → platform map    │ │
+│                          │  Code places source links per platform  │ │
+│                          └───────────────────────────┬────────────┘ │
 │                                                      │              │
 │                               ┌──────────────────────▼───────────┐  │
 │                               │  Buffer GraphQL API (shareNow)   │  │
-│                               │  (one mutation per channel ID)   │  │
+│                               │  (main post → each platform)     │  │
 │                               └──────────────────────┬───────────┘  │
 │                                                      │              │
 │                       ┌──────────────────────────────▼───────────┐  │
 │                       │  Record key → posted.json (commit back)  │  │
 │                       └──────────────────────────────┬───────────┘  │
 │                                                      │              │
-│                                          ┌───────────▼───────────┐  │
-│                                          │  Telegram Bot API     │  │
-│                                          │  (POST notification)  │  │
-│                                          └───────────────────────┘  │
+│                               ┌──────────────────────▼───────────┐  │
+│                               │  Telegram: hero image (or gen    │  │
+│                               │  prompt) + per-platform digest   │  │
+│                               │  with replies to post manually   │  │
+│                               └──────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -126,22 +135,28 @@ Under the hood, `rss-parser` makes an HTTP GET request to each URL, parses the X
 | `item.pubDate` | Raw `<pubDate>` string | — |
 
 #### Time Window Filtering
-After all feeds are fetched and their items concatenated into a single flat array, each item is evaluated against a 118-minute (1 hour 58 minutes) maximum age window:
+After all feeds are fetched and their items concatenated into a single flat array, each item is evaluated against a **20-hour** maximum age window (`MAX_AGE_MS`):
 
 ```
-cutoff = Date.now() - (118 * 60 * 1000)
+cutoff = Date.now() - (20 * 60 * 60 * 1000)
 keep item if: new Date(item.isoDate ?? item.pubDate).getTime() >= cutoff
 ```
 
 The script prefers `isoDate` over `pubDate` because `isoDate` is already normalised to ISO 8601 by `rss-parser` and parses reliably. Items with no parseable date field are **discarded silently**.
 
-The 4-hour window is intentionally wider than the 2-hour trigger interval. Because the external scheduler (cron-job.org) is reliable but not perfectly guaranteed, this window ensures a missed trigger does not silently drop articles — the next run will catch up on the full gap. Duplicate posting is prevented by the deduplication layer (`posted.json`), not by the time window, so widening it carries no risk of reposts.
+The 20-hour window must span the **longest gap between the two daily runs** (17:00 → 11:00 IST = 18 hours), or the morning run would miss everything published overnight. The extra ~2 hours is margin for a delayed or missed trigger. Duplicate posting is prevented by the deduplication layer (`posted.json`), not by the time window, so a wide window carries no risk of reposts — re-surfacing already-seen articles simply keeps strong runners-up eligible for the next slot (only the single winner is recorded as posted each run).
 
 If the filtered array is empty after this pass, the script logs a message and calls `process.exit(0)` — a clean exit that GitHub Actions records as a success, not a failure.
 
 ---
 
 ### Step 2 — AI Scoring via Google Gemini
+
+> **Two Gemini calls per run.** Scoring and post-writing are now **separate** calls.
+> Call 1 (`scoreArticles`) scores every article. Call 2 (`writePlatformPosts`) writes
+> platform-specific content for the **single winner only** — so the model never wastes work
+> writing posts for articles that won't be published. If nothing passes the threshold, only
+> Call 1 runs.
 
 **File location:** `index.js` → `scoreArticles()`
 
@@ -177,12 +192,28 @@ Each article in the output array contains:
 | Field | Type | Description |
 |---|---|---|
 | `id` | integer | The article's index in the batch, echoed back so the winner can be mapped to its original feed item (to recover the source link and dedup key) |
-| `title` | string | The original article title, echoed back |
+| `title` | string | The original article title, echoed back (fallback lookup key) |
 | `score` | integer | 0–100 relevance and quality score |
 | `reasoning` | string | One sentence explaining the score |
-| `social_post_text` | string | Ready-to-publish post, under 240 characters (the source link is appended afterward) |
 
-The `social_post_text` character limit is enforced by instruction in the prompt. The target is 240 (not 280) to leave room for the source article link, which is appended automatically after scoring (`<post>\n\n<link>`). Twitter shortens any URL to 23 characters via `t.co`, so 240 + a link stays comfortably under the 280 limit.
+Scoring no longer writes any post text — that happens in Step 3b for the winner only.
+
+---
+
+### Step 2b — Per-Platform Post Writing (winner only)
+
+**File location:** `index.js` → `writePlatformPosts()` / `buildWriterPrompt()`
+
+Once the winner is chosen, a **second Gemini call** writes distinct content for each platform. Key rules baked into the prompt:
+
+- **One angle only** (a number that contradicts an assumption / an unresolved question / a scale comparison) — no full-article summaries.
+- **Banned hooks**: `Imagine…`, `We always assumed…`, `What if…`, and dead-end rhetorical questions.
+- Kept from the old prompt: **zero em dashes**, no headline restatement, plain language, no hashtags, no `Breaking:`/`Wow!` filler.
+- **Per-platform limits**: Threads ≤500, X ≤280, Bluesky ≤300 (native thread preferred).
+- **The model emits NO URLs** — link placement is owned by code (see Step 4) to avoid URL hallucination.
+- Every platform's **main post must read as complete on its own**, because replies are optional and posted manually.
+
+Output (strict JSON) contains `angle_chosen`, `image_description` (an AI image-generation prompt used as a fallback), and a `platforms` object keyed only by the configured platforms, each with `main_post` and a `replies` array.
 
 ---
 
@@ -212,7 +243,18 @@ In the case of a tie (two articles share the identical top score), the first one
 
 ### Step 4 — Buffer GraphQL Post Dispatch
 
-**File location:** `index.js` → `postToBuffer(channelId, text)`
+**File location:** `index.js` → `resolvePlatformChannels()`, `applyLinks()`, `postToBuffer(channelId, text)`
+
+#### Channel → platform auto-detection
+`BUFFER_CHANNEL_IDS` stays a bare comma-separated list — **no labeling needed**. At runtime the script queries Buffer (`account { organizations }` then `channels(input) { id name service }`) and maps each channel's `service` onto a platform key: `twitter`/`x` → `x`, `threads` → `threads`, `bluesky` → `bluesky`. Only detected, supported platforms are written for and posted to; unsupported services are skipped with a warning. This is how the script knows which platform-specific post goes to which channel.
+
+#### Link placement (code owns URLs)
+The writer model never emits URLs. `applyLinks()` attaches the source link per platform:
+
+- **threads** — link appended to the **main post** (`<post>\n\n<link>`); main post is self-sufficient.
+- **x** — main tweet stays **link-free**; the link rides in the first **reply** (which you post manually). If the model produced no reply, the link becomes the reply on its own.
+- **bluesky** — link appended to the **last thread post**; if there's no thread, the main post stays link-free.
+- **JC articles** — no link anywhere (they carry no shareable source), preserving prior behavior.
 
 #### Why GraphQL
 Buffer's primary public API is GraphQL. Using native `fetch` with a raw GraphQL mutation avoids taking a dependency on Buffer's own SDK and keeps the implementation transparent and auditable.
@@ -244,45 +286,61 @@ The `createPost` return type is a **GraphQL union** — it resolves to either `P
 ```json
 {
   "input": {
-    "text": "<generated social_post_text + source link>",
-    "channelId": "<current channel ID>",
+    "text": "<platform-specific main post (link applied per Step 4 rules)>",
+    "channelId": "<the channel resolved for this platform>",
     "schedulingType": "automatic",
     "mode": "shareNow"
   }
 }
 ```
 
-`mode: "shareNow"` tells Buffer to publish the post immediately rather than slotting it into the channel's posting schedule. The valid `ShareMode` enum values (from the Buffer schema) are: `shareNow` (publish now), `addToQueue` (next open queue slot), `shareNext` (front of queue), `customScheduled` (a specific `dueAt`), and `recommendedTime` (Buffer's suggested time). The `text` field is the Gemini-generated post with the article's source link appended as `<post>\n\n<link>`.
+`mode: "shareNow"` tells Buffer to publish the post immediately rather than slotting it into the channel's posting schedule. The valid `ShareMode` enum values (from the Buffer schema) are: `shareNow` (publish now), `addToQueue` (next open queue slot), `shareNext` (front of queue), `customScheduled` (a specific `dueAt`), and `recommendedTime` (Buffer's suggested time). Only the **main post** is dispatched — reply/thread follow-ups are never auto-posted; they are delivered via Telegram for you to post manually.
 
-#### Multi-Channel Loop
-`BUFFER_CHANNEL_IDS` is a comma-separated string of Buffer channel IDs. The script iterates through them **sequentially** (not concurrently) with a `for...of` loop. Each iteration is wrapped in `try/catch` so a failure on one channel (e.g. a disconnected Twitter account) does not prevent the post from being sent to the remaining channels.
+#### Per-Platform Loop
+The script loops over the resolved `{ platform: channelId }` map and posts each platform's **own** main post to its channel. Each iteration is wrapped in `try/catch` so a failure on one channel (e.g. a disconnected account) does not prevent the others. The dedup key is recorded only after at least one channel accepts.
 
 ---
 
-### Step 5 — Telegram Notification
+### Step 5 — Telegram Digest (hero image + per-platform posts + manual replies)
 
-**File location:** `index.js` → `sendTelegramAlert(score, title, postText)`
+**File location:** `index.js` → `scrapeHeroImage()`, `sendTelegramPhoto()`, `sendTelegramDigest()`
 
 #### Telegram Bot API
-A Telegram bot (created via `@BotFather`) sends messages to a chat via a single authenticated HTTP `POST` to `https://api.telegram.org/bot<token>/sendMessage`. No phone activation, webhooks, or polling required — just a bot token and the target chat ID.
+A Telegram bot (created via `@BotFather`) sends messages/photos to a chat via a single authenticated HTTP `POST` to `https://api.telegram.org/bot<token>/{sendMessage,sendPhoto}`. No phone activation, webhooks, or polling required — just a bot token and the target chat ID.
+
+#### Hero image
+Before the digest, the script fetches the winning article's page and extracts its `og:image` (fallback `twitter:image`). If found, it is sent as a photo via `sendPhoto` so you can attach it to your posts. If no hero image exists, the digest instead includes the `image_description` — an AI image-generation prompt — so you can generate one. (JC articles carry no source URL, so no scrape is attempted.)
 
 #### Message Format
-The message uses Telegram's **MarkdownV2** dialect (`parse_mode: "MarkdownV2"`). Asterisks render as **bold**, and the run timestamp is included so you can confirm the cron is firing on schedule:
+The digest uses Telegram's **MarkdownV2** dialect (`parse_mode: "MarkdownV2"`). It shows the score, source, the chosen angle, and — per platform — the **main post that was published** plus the **reply/thread follow-ups for you to post manually**:
 
 ```
-✅ Automated Post Queued!
+✅ Automated Post Published!
 
 🕐 Run Time: Tue, 03 Jun 2026 08:00:12 GMT
-AI Score: 87
+AI Score: 91
 Source Article: Why Serverless Is Still Winning in 2026
+🎯 Angle: A cold number that contradicts assumption
+🔗 Source: https://example.com/serverless-2026
 
-Generated Post:
-Serverless adoption hits 68% of new workloads in 2026...
+━━━ THREADS ━━━
+<main post, with link>
 
-https://example.com/serverless-2026
+━━━ X ━━━
+<clean main tweet>
+
+Reply to post manually:
+  1. Full breakdown here:
+     https://example.com/serverless-2026
+
+━━━ BLUESKY ━━━
+<main post>
+
+Reply thread to post manually:
+  1. <continuation post, link on the last one>
+
+🖼 Image: hero image sent above — attach it to the post.
 ```
-
-The `Generated Post` block shows the exact text that was sent to Buffer — including the appended source link.
 
 #### MarkdownV2 Escaping
 MarkdownV2 reserves many characters (`_ * [ ] ( ) ~ \` > # + = | { } . ! -`). Any of these appearing in the article title or post body would otherwise break parsing, so they are escaped with a leading backslash via a small `escapeMd()` helper before the message is assembled. Telegram renders the escaped text correctly (the backslashes are not displayed).
@@ -303,7 +361,7 @@ All variables are read from `process.env` at runtime. In GitHub Actions they are
 | `SCORING_CRITERIA` | Yes | Free text | Natural-language description of your niche and what makes a post worth sharing. This is injected verbatim into the AI system prompt. The more specific, the better the scores. |
 | `POSTING_THRESHOLD` | Yes | Integer 0–100 | Minimum score an article must achieve to be published. Recommended starting point: `75`–`85`. |
 | `BUFFER_API_KEY` | Yes | String | Buffer personal access token from Buffer → Settings → API |
-| `BUFFER_CHANNEL_IDS` | Yes | Comma-separated strings | Buffer channel IDs for the target social accounts. Find these via the `channels` GraphQL query or Buffer's web UI. |
+| `BUFFER_CHANNEL_IDS` | Yes | Comma-separated strings | Buffer channel IDs for the target social accounts (Threads / X / Bluesky). Find these via the `channels` GraphQL query or Buffer's web UI. **No labeling needed** — the script auto-detects each channel's platform from Buffer's `service` field. |
 | `TELEGRAM_BOT_TOKEN` | Yes | String | Bot token from `@BotFather` (format: `123456789:ABCdef...`) |
 | `TELEGRAM_CHAT_ID` | Yes | String | Your chat ID from `@userinfobot` (format: `123456789`) |
 
@@ -332,10 +390,10 @@ major protocol upgrades, and significant on-chain data findings. Score down pric
 ### Trigger Configuration
 ```yaml
 on:
-  workflow_dispatch:   # Triggered externally by cron-job.org every 2 hours
+  workflow_dispatch:   # Triggered externally by cron-job.org twice a day (05:30 & 11:30 UTC)
 ```
 
-The workflow is triggered exclusively via `workflow_dispatch` — a GitHub API event fired by an external scheduler (cron-job.org) every 2 hours. This replaces GitHub's built-in `schedule` trigger, which is unreliable on the free tier (runs are often delayed 5–30 minutes or skipped entirely under platform load).
+The workflow is triggered exclusively via `workflow_dispatch` — a GitHub API event fired by an external scheduler (cron-job.org) **twice a day, at 05:30 & 11:30 UTC (11:00 & 17:00 IST)**. This replaces GitHub's built-in `schedule` trigger, which is unreliable on the free tier (runs are often delayed 5–30 minutes or skipped entirely under platform load).
 
 GitHub's built-in `schedule` was removed because:
 1. It fires at peak load times (top-of-the-hour) causing delays and outright skips
@@ -358,12 +416,12 @@ The external dispatcher (`cron-job.org`) fires within seconds of the scheduled t
 |---|---|
 | URL | `https://api.github.com/repos/YOUR_USERNAME/AutoRSS/actions/workflows/cron-job.yml/dispatches` |
 | Method | `POST` |
-| Schedule | Every 2 hours |
+| Schedule | Twice daily at **05:30 and 11:30 UTC** (cron: `30 5,11 * * *`) |
 | Header 1 | `Authorization: Bearer YOUR_PAT_TOKEN` |
 | Header 2 | `Content-Type: application/json` |
 | Request body | `{"ref":"main"}` |
 
-4. Save — cron-job.org will POST to GitHub every 2 hours; GitHub fires `workflow_dispatch` and the run starts within seconds.
+4. Save — cron-job.org will POST to GitHub at 05:30 and 11:30 UTC; GitHub fires `workflow_dispatch` and the run starts within seconds.
 
 **Verify it works:** After the first trigger, you should see a `204 No Content` response in cron-job.org's History tab and a new run appear in GitHub Actions almost immediately. You can also test it manually from PowerShell:
 ```powershell
@@ -386,11 +444,25 @@ No output = success (`204`). A new run appears in Actions within seconds.
 jobs:
   run-autorss:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 35
 ```
 
 - `ubuntu-latest` provides a clean Node.js-compatible Linux environment.
-- `timeout-minutes: 10` is a hard ceiling. If any API call hangs indefinitely (e.g. a Gemini timeout with no response), the job is killed at 10 minutes rather than consuming Actions minutes until the 6-hour GitHub maximum.
+- `timeout-minutes: 35` is a hard ceiling sized for the built-in retry loop (below). A normal run finishes in ~1–2 minutes; the extra headroom covers up to two 10-minute waits between retries.
+
+#### Built-in 10-minute retry
+The run step reruns `node index.js` **up to 3 times, waiting 10 minutes between attempts**, so a transient outage (e.g. Gemini API down → nothing posted) recovers on its own without a human re-trigger:
+
+```yaml
+run: |
+  for attempt in 1 2 3; do
+    if node index.js; then exit 0; fi
+    if [ "$attempt" -lt 3 ]; then sleep 600; fi
+  done
+  exit 1
+```
+
+A successful run exits on the first attempt and never sleeps. Because `posted.json` is written to disk mid-run and re-read at the start of each attempt, an already-posted article is deduped out — so a retry only re-posts when the earlier attempt posted **nothing**.
 
 ### Step Breakdown
 
@@ -399,7 +471,7 @@ jobs:
 | Checkout | `actions/checkout@v4` | Clones the repo so `index.js`, `package.json`, and `posted.json` are available |
 | Setup Node | `actions/setup-node@v4` with `node-version: '24'` and `cache: 'npm'` | Installs Node 24, caches the npm dependency cache between runs |
 | Install deps | `npm ci` | Installs exact versions from `package-lock.json` — reproducible and faster than `npm install` |
-| Run script | `node index.js` | Executes the pipeline; any non-zero exit code fails the workflow run |
+| Run script | retry loop around `node index.js` | Executes the pipeline; retries after 10 min on failure (3 attempts). A final failure fails the run |
 | Persist history | `if: always()` git commit | Commits the updated `posted.json` back to the repo (only if it changed) |
 | Notify on failure | `if: failure()` curl | Sends a Telegram message with a link to the failed run's logs |
 
@@ -426,7 +498,7 @@ The script uses a layered error model:
 |---|---|---|
 | Individual RSS feed | Network error, malformed XML | Logs error, skips that feed, continues with others |
 | All RSS feeds | Every feed returns empty or fails | Exits with code 0 after logging — not a workflow failure |
-| No recent articles | All articles older than 4 hours | Exits with code 0 — expected quiet run |
+| No recent articles | All articles older than the 20-hour window | Exits with code 0 — expected quiet run |
 | Gemini API | Network error, malformed JSON response | Exits with code 1 — workflow run marked as failed; prompts investigation |
 | No articles pass threshold | All scores below threshold | Exits with code 0 — expected run, not an error |
 | Buffer API (single channel) | GraphQL error, MutationError, network error | Logs error, continues to next channel ID |
@@ -471,7 +543,7 @@ Navigate to your repo → **Settings** → **Secrets and variables** → **Actio
 Add all eight secrets listed in the [Environment Variables Reference](#environment-variables-reference) table.
 
 ### Step 5 — Set up cron-job.org as the external scheduler
-Follow the [External Scheduler Setup](#external-scheduler-setup-cron-joborg) instructions above to configure cron-job.org to trigger the workflow every 2 hours.
+Follow the [External Scheduler Setup](#external-scheduler-setup-cron-joborg) instructions above to configure cron-job.org to trigger the workflow twice a day (05:30 & 11:30 UTC).
 
 To test immediately before the first scheduled trigger, go to **Actions** → **AutoRSS Feed Processor** → **Run workflow**.
 
@@ -509,13 +581,13 @@ node index.js
 ```
 
 ### Safe dry-run tip
-To test without actually posting to Buffer or sending a Telegram message, temporarily comment out the calls to `postToBuffer` and `sendTelegramAlert` in `main()` (and the `savePostedKey` call) and log the `postText` instead. All upstream steps (RSS fetch, dedup, Gemini scoring, threshold filtering) will execute normally.
+To test without actually posting to Buffer or sending a Telegram message, temporarily stub the calls to `postToBuffer`, `sendTelegramPhoto`, and `sendTelegramDigest` in `main()` (and the `savePostedDB` call) to `console.log` instead. All upstream steps (RSS fetch, dedup, Gemini scoring, threshold filtering, per-platform writing, link placement) will execute normally. The pure helpers (`applyLinks`, `serviceToPlatform`, `buildWriterPrompt`) are exported for unit testing.
 
 ---
 
 ## Limitations & Known Behaviours
 
-- **Scheduling is driven by cron-job.org, not GitHub's built-in cron.** The workflow uses `workflow_dispatch` only. cron-job.org fires the trigger every 2 hours reliably; if it goes down, no runs fire until it recovers. Monitor cron-job.org's History tab to confirm each trigger lands. The 4-hour fetch window means a single missed trigger is self-healing — the next run catches up on the gap without reposting (dedup handles that).
+- **Scheduling is driven by cron-job.org, not GitHub's built-in cron.** The workflow uses `workflow_dispatch` only. cron-job.org fires the trigger twice a day (05:30 & 11:30 UTC); if it goes down, no runs fire until it recovers. Monitor cron-job.org's History tab to confirm each trigger lands. The 20-hour fetch window means a single missed trigger is largely self-healing — the next run catches up on the gap without reposting (dedup handles that).
 
 - **GitHub disables `workflow_dispatch` on inactive repositories.** If no commits are pushed and no runs are triggered for 60 days, GitHub may pause the workflow. cron-job.org's regular triggers count as activity and should prevent this.
 
@@ -525,6 +597,8 @@ To test without actually posting to Buffer or sending a Telegram message, tempor
 
 - **Dedup depends on the commit-back landing.** The workflow commits the updated `posted.json` back to the repo after each run. If that push fails (e.g. permissions misconfigured), the next run won't see the latest history and could re-post. The `concurrency` group prevents overlapping runs from racing the push.
 
-- **Gemini `social_post_text` character count is advisory.** The model is instructed to stay under 240 characters (leaving room for the appended source link) but this is not mechanically enforced. If a generated post is over the limit, Twitter may truncate it silently while Threads may accept it (Threads supports up to 500 characters).
+- **Per-platform character counts are advisory.** The writer is instructed to stay within each platform's budget (Threads ≤500, X ≤280, Bluesky ≤300) but this is not mechanically enforced. If a generated post is over the limit, the platform may truncate it silently.
 
-- **Posts publish immediately (`shareNow`).** Whenever a qualifying article is found, it is published right away — at whatever time the cron happens to run (including overnight hours in your timezone, since cron is UTC). If you'd rather have Buffer publish only during configured peak slots, change `mode` to `addToQueue` in `index.js` and set up a posting schedule per channel in the Buffer dashboard.
+- **Replies are delivered, not posted.** Only the main post is auto-published. Reply/thread follow-ups (and the X source link, which lives in the reply) are surfaced in the Telegram digest for you to post manually. The main post always reads as complete on its own, so skipping the replies loses nothing essential — though on X and Bluesky the source link only reaches your audience if you post the reply.
+
+- **Posts publish immediately (`shareNow`).** When a qualifying article is found, its main post is published right away — at whichever of the two daily slots the cron runs (05:30 & 11:30 UTC = 11:00 & 17:00 IST). If you'd rather have Buffer publish only during configured peak slots, change `mode` to `addToQueue` in `index.js` and set up a posting schedule per channel in the Buffer dashboard.
