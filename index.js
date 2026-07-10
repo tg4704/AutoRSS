@@ -284,20 +284,22 @@ function buildWriterPrompt(original, platforms, sourceLink) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // The code appends the source link to the Threads main post, so its text budget is
-  // reduced by the link length. These are HARD caps enforced after generation (over-limit
-  // posts are trimmed), so the model should write comfortably under them.
-  const threadsBudget = Math.max(120, PLATFORM_LIMITS.threads - (hasSourceLink ? sourceLink.length + 2 : 0));
+  // On every platform the main post stays link-free (links suppress reach); the source
+  // link is added in a reply the operator posts manually. These are HARD caps enforced
+  // after generation (over-limit posts are trimmed), so write comfortably under them.
+  const replyRule = hasSourceLink
+    ? ' "replies" must contain exactly ONE short lead-in sentence (the source link is attached to it automatically afterward), e.g. "Full breakdown here:" or "Source and the full numbers:".'
+    : ' "replies" is an empty array (no source link available).';
 
   const platformSpecs = platforms.map((p) => {
     if (p === 'threads') {
-      return `- threads: main_post is a HARD LIMIT of ${threadsBudget} characters (a source link is appended after your text, so stay under this). Front-load the strongest line. "replies" is usually an empty array; add one only if there is a genuine follow-up thought.`;
+      return `- threads: main_post is a HARD LIMIT of ${PLATFORM_LIMITS.threads} characters, NO link. Front-load the strongest line.${replyRule}`;
     }
     if (p === 'x') {
-      return `- x: main_post is a HARD LIMIT of ${PLATFORM_LIMITS.x} characters, NO link. Aim for well under it. "replies" must contain exactly ONE short lead-in sentence (the source link is attached to it automatically afterward), e.g. "Full breakdown here:" or "Source and the full numbers:".`;
+      return `- x: main_post is a HARD LIMIT of ${PLATFORM_LIMITS.x} characters, NO link. Aim for well under it.${replyRule}`;
     }
     if (p === 'bluesky') {
-      return `- bluesky: write natively, do NOT reuse the Threads/X wording verbatim even if the angle is the same. Each post is a HARD LIMIT of ${PLATFORM_LIMITS.bluesky} characters. If the article supports it, prefer a thread: put continuation posts in "replies" (1 to 2 entries). Otherwise leave "replies" empty.`;
+      return `- bluesky: write natively, do NOT reuse the Threads/X wording verbatim even if the angle is the same. Each post is a HARD LIMIT of ${PLATFORM_LIMITS.bluesky} characters, NO link. If the article supports it, prefer a thread: put continuation posts in "replies" (1 to 2 entries)${hasSourceLink ? ' (the source link is appended to the last one automatically)' : ''}. Otherwise "replies" holds a single short lead-in sentence for the link.`;
     }
     return `- ${p}: main_post is a concise standalone post.`;
   }).join('\n');
@@ -523,21 +525,11 @@ function applyLinks(platform, content, link) {
     ? content.replies.map((r) => String(r).trim()).filter(Boolean)
     : [];
 
-  if (platform === 'threads') {
-    // Link is appended to the main post → reserve room for it before clipping.
-    const reserve = link ? link.length + 2 : 0;
-    mainPost = clip(mainPost, cap - reserve);
-    if (link) mainPost = `${mainPost}\n\n${link}`;
-    replies = replies.map((r) => clip(r, cap));
-    return { mainPost, replies };
-  }
-
-  if (platform === 'x') {
-    // Main tweet stays clean (no link); link rides in the first reply.
+  if (platform === 'threads' || platform === 'x') {
+    // Main post stays clean (no link); the link rides in the first reply the operator posts.
     mainPost = clip(mainPost, cap);
     if (link) {
-      // X shortens URLs to ~23 chars via t.co; reserve a fixed slot regardless of length.
-      const leadCap = cap - 24;
+      const leadCap = cap - link.length - 1; // room for the link on the reply line
       const lead    = replies[0] ? `${clip(replies[0], leadCap)}\n${link}` : link;
       replies = [lead, ...replies.slice(1).map((r) => clip(r, cap))];
     } else {
@@ -642,9 +634,10 @@ async function sendTelegramPhoto(photoUrl, caption) {
   }
 }
 
-// Per-platform digest: shows what was auto-posted (main post) plus the replies the operator
-// posts manually, the angle, and either confirmation the hero image was sent or an AI image
-// generation prompt when no hero image exists.
+// Per-platform digest with step-by-step instructions. For each platform it shows the main
+// post that Buffer already published and, when there are follow-ups, exactly what to reply
+// with manually (the source link lives in that reply). Also delivers the hero image or an
+// AI image-generation prompt.
 async function sendTelegramDigest({ score, title, angle, sourceLink, jcNumber, perPlatform, heroSent, imageDescription }) {
   const runTime = new Date().toUTCString();
   const jcLine  = jcNumber != null ? `*📖 JC Article:* \\#${jcNumber}\n` : '';
@@ -652,19 +645,34 @@ async function sendTelegramDigest({ score, title, angle, sourceLink, jcNumber, p
 
   const blocks = perPlatform.map(({ platform, mainPost, replies }) => {
     const label = platform.toUpperCase();
-    let block = `━━━ *${escapeMd(label)}* ━━━\n${escapeMd(mainPost)}`;
+    const isThread = platform === 'bluesky' && replies.length > 1;
+    let block =
+      `━━━ *${escapeMd(label)}* ━━━\n` +
+      `*✅ Main post \\(already published\\):*\n${escapeMd(mainPost)}`;
+
     if (replies.length > 0) {
+      const stepLabel = isThread
+        ? '👉 *Your turn:* reply to that post, then keep the thread going with these, in order:'
+        : '👉 *Your turn:* reply to that post with this to add the source link:';
       const replyLines = replies
         .map((r, i) => `  ${i + 1}\\. ${escapeMd(r)}`)
         .join('\n');
-      block += `\n\n_Reply${replies.length > 1 ? ' thread' : ''} to post manually:_\n${replyLines}`;
+      block += `\n\n${stepLabel}\n${replyLines}`;
+    } else {
+      block += `\n\n_Nothing else to do — the main post stands alone\\._`;
     }
     return block;
   }).join('\n\n');
 
+  const howTo =
+    `📋 *How to finish up:* each main post below is already live\\. ` +
+    `Reply to it manually with the line\\(s\\) shown to add the source link` +
+    (perPlatform.some((p) => p.platform === 'bluesky') ? ` / continue the thread` : '') +
+    `\\.`;
+
   const imageLine = heroSent
-    ? `*🖼 Image:* hero image sent above — attach it to the post\\.`
-    : `*🖼 No hero image found\\. Generation prompt:*\n${escapeMd(imageDescription ?? 'N/A')}`;
+    ? `*🖼 Hero image sent above* — attach it when you post the reply, or repost the main with it\\.`
+    : `*🖼 No hero image found\\. Use this prompt to generate one:*\n${escapeMd(imageDescription ?? 'N/A')}`;
 
   const message =
     `✅ *Automated Post Published\\!*\n\n` +
@@ -674,7 +682,7 @@ async function sendTelegramDigest({ score, title, angle, sourceLink, jcNumber, p
     `*Source Article:* ${escapeMd(title)}\n` +
     (angle ? `*🎯 Angle:* ${escapeMd(angle)}\n` : '') +
     linkLine +
-    `\n${blocks}\n\n` +
+    `\n${howTo}\n\n${blocks}\n\n` +
     imageLine;
 
   await sendTelegramMessage(message);
