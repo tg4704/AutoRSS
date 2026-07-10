@@ -248,13 +248,15 @@ In the case of a tie (two articles share the identical top score), the first one
 #### Channel → platform auto-detection
 `BUFFER_CHANNEL_IDS` stays a bare comma-separated list — **no labeling needed**. At runtime the script queries Buffer (`account { organizations }` then `channels(input) { id name service }`) and maps each channel's `service` onto a platform key: `twitter`/`x` → `x`, `threads` → `threads`, `bluesky` → `bluesky`. Only detected, supported platforms are written for and posted to; unsupported services are skipped with a warning. This is how the script knows which platform-specific post goes to which channel.
 
-#### Link placement (code owns URLs)
-The writer model never emits URLs. `applyLinks()` attaches the source link per platform:
+#### Link placement + limit enforcement (code owns URLs)
+The writer model never emits URLs. `applyLinks()` places the source link per platform and **hard-enforces each platform's character limit** (LLMs can't count reliably and Buffer rejects over-limit posts), trimming at a word boundary via `clip()`:
 
-- **threads** — link appended to the **main post** (`<post>\n\n<link>`); main post is self-sufficient.
-- **x** — main tweet stays **link-free**; the link rides in the first **reply** (which you post manually). If the model produced no reply, the link becomes the reply on its own.
-- **bluesky** — link appended to the **last thread post**; if there's no thread, the main post stays link-free.
+- **Every main post stays link-free** (links suppress reach) — the source link goes in a **reply you post manually**.
+- **threads / x** — clean main post; the link rides in the first **reply**. If the model produced no reply, the link becomes the reply on its own.
+- **bluesky** — clean main post; the link is appended to the **last thread post** (or its single link reply).
 - **JC articles** — no link anywhere (they carry no shareable source), preserving prior behavior.
+
+The main post sent to Buffer is always within limits (Threads 500, X 280, Bluesky 300, minus a small margin); manually-posted replies are trimmed too so they stay postable.
 
 #### Why GraphQL
 Buffer's primary public API is GraphQL. Using native `fetch` with a raw GraphQL mutation avoids taking a dependency on Buffer's own SDK and keeps the implementation transparent and auditable.
@@ -312,7 +314,7 @@ A Telegram bot (created via `@BotFather`) sends messages/photos to a chat via a 
 Before the digest, the script fetches the winning article's page and extracts its `og:image` (fallback `twitter:image`). If found, it is sent as a photo via `sendPhoto` so you can attach it to your posts. If no hero image exists, the digest instead includes the `image_description` — an AI image-generation prompt — so you can generate one. (JC articles carry no source URL, so no scrape is attempted.)
 
 #### Message Format
-The digest uses Telegram's **MarkdownV2** dialect (`parse_mode: "MarkdownV2"`). It shows the score, source, the chosen angle, and — per platform — the **main post that was published** plus the **reply/thread follow-ups for you to post manually**:
+The digest uses Telegram's **MarkdownV2** dialect (`parse_mode: "MarkdownV2"`). It shows the score, source, the chosen angle, and — per platform — step-by-step instructions: the **main post already published** and exactly what to **reply with manually** (the source link lives in that reply):
 
 ```
 ✅ Automated Post Published!
@@ -323,23 +325,33 @@ Source Article: Why Serverless Is Still Winning in 2026
 🎯 Angle: A cold number that contradicts assumption
 🔗 Source: https://example.com/serverless-2026
 
+📋 How to finish up: each main post below is already live. Reply to it
+manually with the line(s) shown to add the source link / continue the thread.
+
 ━━━ THREADS ━━━
-<main post, with link>
+✅ Main post (already published):
+<clean main post>
 
-━━━ X ━━━
-<clean main tweet>
-
-Reply to post manually:
+👉 Your turn: reply to that post with this to add the source link:
   1. Full breakdown here:
      https://example.com/serverless-2026
 
-━━━ BLUESKY ━━━
-<main post>
+━━━ X ━━━
+✅ Main post (already published):
+<clean main tweet>
 
-Reply thread to post manually:
+👉 Your turn: reply to that post with this to add the source link:
+  1. Source and the full numbers:
+     https://example.com/serverless-2026
+
+━━━ BLUESKY ━━━
+✅ Main post (already published):
+<clean main post>
+
+👉 Your turn: reply to that post, then keep the thread going with these, in order:
   1. <continuation post, link on the last one>
 
-🖼 Image: hero image sent above — attach it to the post.
+🖼 Hero image sent above — attach it when you post the reply, or repost the main with it.
 ```
 
 #### MarkdownV2 Escaping
@@ -599,6 +611,6 @@ To test without actually posting to Buffer or sending a Telegram message, tempor
 
 - **Per-platform character counts are advisory.** The writer is instructed to stay within each platform's budget (Threads ≤500, X ≤280, Bluesky ≤300) but this is not mechanically enforced. If a generated post is over the limit, the platform may truncate it silently.
 
-- **Replies are delivered, not posted.** Only the main post is auto-published. Reply/thread follow-ups (and the X source link, which lives in the reply) are surfaced in the Telegram digest for you to post manually. The main post always reads as complete on its own, so skipping the replies loses nothing essential — though on X and Bluesky the source link only reaches your audience if you post the reply.
+- **Replies are delivered, not posted.** Only the main post is auto-published. Reply/thread follow-ups (and the source link, which always lives in a reply) are surfaced in the Telegram digest for you to post manually. The main post always reads as complete on its own, so skipping the replies loses nothing essential — though the source link only reaches your audience once you post the reply.
 
 - **Posts publish immediately (`shareNow`).** When a qualifying article is found, its main post is published right away — at whichever of the two daily slots the cron runs (05:30 & 11:30 UTC = 11:00 & 17:00 IST). If you'd rather have Buffer publish only during configured peak slots, change `mode` to `addToQueue` in `index.js` and set up a posting schedule per channel in the Buffer dashboard.

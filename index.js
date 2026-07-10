@@ -277,21 +277,29 @@ ${articlesPayload}`;
 // One Gemini call for the single winner. Produces a distinct main post per platform plus
 // optional follow-up replies (posted manually by the operator). The model NEVER emits URLs
 // — link placement is owned by the code (see applyLinks) to avoid URL hallucination.
-function buildWriterPrompt(original, platforms, hasSourceLink) {
+function buildWriterPrompt(original, platforms, sourceLink) {
+  const hasSourceLink = Boolean(sourceLink);
   const snippet = (original.contentSnippet ?? original.summary ?? '')
     .slice(0, SNIPPET_MAX_CHARS)
     .replace(/\s+/g, ' ')
     .trim();
 
+  // On every platform the main post stays link-free (links suppress reach); the source
+  // link is added in a reply the operator posts manually. These are HARD caps enforced
+  // after generation (over-limit posts are trimmed), so write comfortably under them.
+  const replyRule = hasSourceLink
+    ? ' "replies" must contain exactly ONE short lead-in sentence (the source link is attached to it automatically afterward), e.g. "Full breakdown here:" or "Source and the full numbers:".'
+    : ' "replies" is an empty array (no source link available).';
+
   const platformSpecs = platforms.map((p) => {
     if (p === 'threads') {
-      return `- threads: main_post max ${PLATFORM_LIMITS.threads} chars. Front-load the strongest line (Threads truncates after ~4 lines). "replies" is usually an empty array; add one only if there is a genuine follow-up thought.`;
+      return `- threads: main_post is a HARD LIMIT of ${PLATFORM_LIMITS.threads} characters, NO link. Front-load the strongest line.${replyRule}`;
     }
     if (p === 'x') {
-      return `- x: main_post max ${PLATFORM_LIMITS.x} chars, NO link. "replies" must contain exactly ONE short lead-in sentence (the source link is attached to it automatically afterward), e.g. "Full breakdown here:" or "Source and the full numbers:".`;
+      return `- x: main_post is a HARD LIMIT of ${PLATFORM_LIMITS.x} characters, NO link. Aim for well under it.${replyRule}`;
     }
     if (p === 'bluesky') {
-      return `- bluesky: write natively, do NOT reuse the Threads/X wording verbatim even if the angle is the same. Each post max ${PLATFORM_LIMITS.bluesky} chars. If the article supports it, prefer a thread: put continuation posts in "replies" (1 to 2 entries). Otherwise leave "replies" empty.`;
+      return `- bluesky: write natively, do NOT reuse the Threads/X wording verbatim even if the angle is the same. Each post is a HARD LIMIT of ${PLATFORM_LIMITS.bluesky} characters, NO link. If the article supports it, prefer a thread: put continuation posts in "replies" (1 to 2 entries)${hasSourceLink ? ' (the source link is appended to the last one automatically)' : ''}. Otherwise "replies" holds a single short lead-in sentence for the link.`;
     }
     return `- ${p}: main_post is a concise standalone post.`;
   }).join('\n');
@@ -351,8 +359,8 @@ ${platformSchema}
 }`;
 }
 
-async function writePlatformPosts(original, platforms, hasSourceLink) {
-  const prompt  = buildWriterPrompt(original, platforms, hasSourceLink);
+async function writePlatformPosts(original, platforms, sourceLink) {
+  const prompt  = buildWriterPrompt(original, platforms, sourceLink);
   const rawText = await generateWithRetry(prompt);
   const parsed  = JSON.parse(rawText);
   if (!parsed || typeof parsed.platforms !== 'object') {
@@ -486,32 +494,65 @@ async function postToBuffer(channelId, text) {
   return false;
 }
 
-// ── Link placement (code owns URLs; the LLM never emits them) ─────────────────
-// Given the winner's link (or '' for JC / no-link), attach it per platform rules and
-// return { mainPost, replies } ready for posting/delivery.
+// ── Character-limit enforcement ───────────────────────────────────────────────
+// LLMs can't count characters reliably, and Buffer HARD-rejects over-limit posts, so we
+// trim mechanically as a guarantee. Cuts at a word boundary when possible and adds an
+// ellipsis, never exceeding `max`. A few chars of margin are left by callers to absorb
+// grapheme/link-counting differences between platforms.
+function clip(text, max) {
+  const t = String(text ?? '').trim();
+  if (max <= 0) return '';
+  if (t.length <= max) return t;
+  if (max <= 1) return t.slice(0, max);
+  const hard      = t.slice(0, max - 1);        // leave room for the ellipsis
+  const lastSpace = hard.lastIndexOf(' ');
+  const body      = lastSpace > max * 0.6 ? hard.slice(0, lastSpace) : hard;
+  return `${body.trimEnd()}…`;
+}
+
+// ── Link placement + limit enforcement (code owns URLs; the LLM never emits them) ──
+// Given the winner's link (or '' for JC / no-link), attach it per platform rules, enforce
+// each platform's hard character limit, and return { mainPost, replies } ready for
+// posting/delivery. `mainPost` (what we auto-post to Buffer) is always within limits;
+// replies (posted manually) are trimmed too so they stay postable.
+const LIMIT_MARGIN = 6; // absorb grapheme/whitespace/link-counting differences
+
 function applyLinks(platform, content, link) {
-  const mainPost = String(content?.main_post ?? '').trim();
-  const replies  = Array.isArray(content?.replies)
+  const limit    = PLATFORM_LIMITS[platform] ?? 280;
+  const cap       = limit - LIMIT_MARGIN;
+  let   mainPost = String(content?.main_post ?? '').trim();
+  let   replies  = Array.isArray(content?.replies)
     ? content.replies.map((r) => String(r).trim()).filter(Boolean)
     : [];
 
-  if (!link) return { mainPost, replies };
+  if (platform === 'threads' || platform === 'x') {
+    // Main post stays clean (no link); the link rides in the first reply the operator posts.
+    mainPost = clip(mainPost, cap);
+    if (link) {
+      const leadCap = cap - link.length - 1; // room for the link on the reply line
+      const lead    = replies[0] ? `${clip(replies[0], leadCap)}\n${link}` : link;
+      replies = [lead, ...replies.slice(1).map((r) => clip(r, cap))];
+    } else {
+      replies = replies.map((r) => clip(r, cap));
+    }
+    return { mainPost, replies };
+  }
 
-  if (platform === 'threads') {
-    return { mainPost: `${mainPost}\n\n${link}`, replies };
-  }
-  if (platform === 'x') {
-    // Link rides in the reply so the main tweet stays clean. Guarantee a reply exists.
-    const lead = replies[0] ? `${replies[0]}\n${link}` : link;
-    return { mainPost, replies: [lead, ...replies.slice(1)] };
-  }
   if (platform === 'bluesky') {
-    // Link goes on the last thread post; if there's no thread, the main post stays link-free.
-    if (replies.length === 0) return { mainPost, replies };
-    const last = `${replies[replies.length - 1]}\n${link}`;
-    return { mainPost, replies: [...replies.slice(0, -1), last] };
+    // Main post stays link-free; link goes on the last thread post.
+    mainPost = clip(mainPost, cap);
+    if (link && replies.length > 0) {
+      const lastIdx = replies.length - 1;
+      replies = replies.map((r, i) =>
+        i === lastIdx ? `${clip(r, cap - (link.length + 1))}\n${link}` : clip(r, cap)
+      );
+    } else {
+      replies = replies.map((r) => clip(r, cap));
+    }
+    return { mainPost, replies };
   }
-  return { mainPost, replies };
+
+  return { mainPost: clip(mainPost, cap), replies: replies.map((r) => clip(r, cap)) };
 }
 
 // ── Hero image scraping (og:image / twitter:image) ────────────────────────────
@@ -593,9 +634,10 @@ async function sendTelegramPhoto(photoUrl, caption) {
   }
 }
 
-// Per-platform digest: shows what was auto-posted (main post) plus the replies the operator
-// posts manually, the angle, and either confirmation the hero image was sent or an AI image
-// generation prompt when no hero image exists.
+// Per-platform digest with step-by-step instructions. For each platform it shows the main
+// post that Buffer already published and, when there are follow-ups, exactly what to reply
+// with manually (the source link lives in that reply). Also delivers the hero image or an
+// AI image-generation prompt.
 async function sendTelegramDigest({ score, title, angle, sourceLink, jcNumber, perPlatform, heroSent, imageDescription }) {
   const runTime = new Date().toUTCString();
   const jcLine  = jcNumber != null ? `*📖 JC Article:* \\#${jcNumber}\n` : '';
@@ -603,19 +645,34 @@ async function sendTelegramDigest({ score, title, angle, sourceLink, jcNumber, p
 
   const blocks = perPlatform.map(({ platform, mainPost, replies }) => {
     const label = platform.toUpperCase();
-    let block = `━━━ *${escapeMd(label)}* ━━━\n${escapeMd(mainPost)}`;
+    const isThread = platform === 'bluesky' && replies.length > 1;
+    let block =
+      `━━━ *${escapeMd(label)}* ━━━\n` +
+      `*✅ Main post \\(already published\\):*\n${escapeMd(mainPost)}`;
+
     if (replies.length > 0) {
+      const stepLabel = isThread
+        ? '👉 *Your turn:* reply to that post, then keep the thread going with these, in order:'
+        : '👉 *Your turn:* reply to that post with this to add the source link:';
       const replyLines = replies
         .map((r, i) => `  ${i + 1}\\. ${escapeMd(r)}`)
         .join('\n');
-      block += `\n\n_Reply${replies.length > 1 ? ' thread' : ''} to post manually:_\n${replyLines}`;
+      block += `\n\n${stepLabel}\n${replyLines}`;
+    } else {
+      block += `\n\n_Nothing else to do — the main post stands alone\\._`;
     }
     return block;
   }).join('\n\n');
 
+  const howTo =
+    `📋 *How to finish up:* each main post below is already live\\. ` +
+    `Reply to it manually with the line\\(s\\) shown to add the source link` +
+    (perPlatform.some((p) => p.platform === 'bluesky') ? ` / continue the thread` : '') +
+    `\\.`;
+
   const imageLine = heroSent
-    ? `*🖼 Image:* hero image sent above — attach it to the post\\.`
-    : `*🖼 No hero image found\\. Generation prompt:*\n${escapeMd(imageDescription ?? 'N/A')}`;
+    ? `*🖼 Hero image sent above* — attach it when you post the reply, or repost the main with it\\.`
+    : `*🖼 No hero image found\\. Use this prompt to generate one:*\n${escapeMd(imageDescription ?? 'N/A')}`;
 
   const message =
     `✅ *Automated Post Published\\!*\n\n` +
@@ -625,7 +682,7 @@ async function sendTelegramDigest({ score, title, angle, sourceLink, jcNumber, p
     `*Source Article:* ${escapeMd(title)}\n` +
     (angle ? `*🎯 Angle:* ${escapeMd(angle)}\n` : '') +
     linkLine +
-    `\n${blocks}\n\n` +
+    `\n${howTo}\n\n${blocks}\n\n` +
     imageLine;
 
   await sendTelegramMessage(message);
@@ -755,7 +812,7 @@ async function main() {
   // ── 3d. Write per-platform content for the winner ──────────────────────────
   let written;
   try {
-    written = await writePlatformPosts(original, platforms, Boolean(sourceLink));
+    written = await writePlatformPosts(original, platforms, sourceLink);
   } catch (err) {
     console.error('[Gemini] Fatal error during per-platform writing:', err.message);
     process.exit(1);
