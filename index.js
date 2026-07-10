@@ -277,21 +277,27 @@ ${articlesPayload}`;
 // One Gemini call for the single winner. Produces a distinct main post per platform plus
 // optional follow-up replies (posted manually by the operator). The model NEVER emits URLs
 // — link placement is owned by the code (see applyLinks) to avoid URL hallucination.
-function buildWriterPrompt(original, platforms, hasSourceLink) {
+function buildWriterPrompt(original, platforms, sourceLink) {
+  const hasSourceLink = Boolean(sourceLink);
   const snippet = (original.contentSnippet ?? original.summary ?? '')
     .slice(0, SNIPPET_MAX_CHARS)
     .replace(/\s+/g, ' ')
     .trim();
 
+  // The code appends the source link to the Threads main post, so its text budget is
+  // reduced by the link length. These are HARD caps enforced after generation (over-limit
+  // posts are trimmed), so the model should write comfortably under them.
+  const threadsBudget = Math.max(120, PLATFORM_LIMITS.threads - (hasSourceLink ? sourceLink.length + 2 : 0));
+
   const platformSpecs = platforms.map((p) => {
     if (p === 'threads') {
-      return `- threads: main_post max ${PLATFORM_LIMITS.threads} chars. Front-load the strongest line (Threads truncates after ~4 lines). "replies" is usually an empty array; add one only if there is a genuine follow-up thought.`;
+      return `- threads: main_post is a HARD LIMIT of ${threadsBudget} characters (a source link is appended after your text, so stay under this). Front-load the strongest line. "replies" is usually an empty array; add one only if there is a genuine follow-up thought.`;
     }
     if (p === 'x') {
-      return `- x: main_post max ${PLATFORM_LIMITS.x} chars, NO link. "replies" must contain exactly ONE short lead-in sentence (the source link is attached to it automatically afterward), e.g. "Full breakdown here:" or "Source and the full numbers:".`;
+      return `- x: main_post is a HARD LIMIT of ${PLATFORM_LIMITS.x} characters, NO link. Aim for well under it. "replies" must contain exactly ONE short lead-in sentence (the source link is attached to it automatically afterward), e.g. "Full breakdown here:" or "Source and the full numbers:".`;
     }
     if (p === 'bluesky') {
-      return `- bluesky: write natively, do NOT reuse the Threads/X wording verbatim even if the angle is the same. Each post max ${PLATFORM_LIMITS.bluesky} chars. If the article supports it, prefer a thread: put continuation posts in "replies" (1 to 2 entries). Otherwise leave "replies" empty.`;
+      return `- bluesky: write natively, do NOT reuse the Threads/X wording verbatim even if the angle is the same. Each post is a HARD LIMIT of ${PLATFORM_LIMITS.bluesky} characters. If the article supports it, prefer a thread: put continuation posts in "replies" (1 to 2 entries). Otherwise leave "replies" empty.`;
     }
     return `- ${p}: main_post is a concise standalone post.`;
   }).join('\n');
@@ -351,8 +357,8 @@ ${platformSchema}
 }`;
 }
 
-async function writePlatformPosts(original, platforms, hasSourceLink) {
-  const prompt  = buildWriterPrompt(original, platforms, hasSourceLink);
+async function writePlatformPosts(original, platforms, sourceLink) {
+  const prompt  = buildWriterPrompt(original, platforms, sourceLink);
   const rawText = await generateWithRetry(prompt);
   const parsed  = JSON.parse(rawText);
   if (!parsed || typeof parsed.platforms !== 'object') {
@@ -486,32 +492,75 @@ async function postToBuffer(channelId, text) {
   return false;
 }
 
-// ── Link placement (code owns URLs; the LLM never emits them) ─────────────────
-// Given the winner's link (or '' for JC / no-link), attach it per platform rules and
-// return { mainPost, replies } ready for posting/delivery.
+// ── Character-limit enforcement ───────────────────────────────────────────────
+// LLMs can't count characters reliably, and Buffer HARD-rejects over-limit posts, so we
+// trim mechanically as a guarantee. Cuts at a word boundary when possible and adds an
+// ellipsis, never exceeding `max`. A few chars of margin are left by callers to absorb
+// grapheme/link-counting differences between platforms.
+function clip(text, max) {
+  const t = String(text ?? '').trim();
+  if (max <= 0) return '';
+  if (t.length <= max) return t;
+  if (max <= 1) return t.slice(0, max);
+  const hard      = t.slice(0, max - 1);        // leave room for the ellipsis
+  const lastSpace = hard.lastIndexOf(' ');
+  const body      = lastSpace > max * 0.6 ? hard.slice(0, lastSpace) : hard;
+  return `${body.trimEnd()}…`;
+}
+
+// ── Link placement + limit enforcement (code owns URLs; the LLM never emits them) ──
+// Given the winner's link (or '' for JC / no-link), attach it per platform rules, enforce
+// each platform's hard character limit, and return { mainPost, replies } ready for
+// posting/delivery. `mainPost` (what we auto-post to Buffer) is always within limits;
+// replies (posted manually) are trimmed too so they stay postable.
+const LIMIT_MARGIN = 6; // absorb grapheme/whitespace/link-counting differences
+
 function applyLinks(platform, content, link) {
-  const mainPost = String(content?.main_post ?? '').trim();
-  const replies  = Array.isArray(content?.replies)
+  const limit    = PLATFORM_LIMITS[platform] ?? 280;
+  const cap       = limit - LIMIT_MARGIN;
+  let   mainPost = String(content?.main_post ?? '').trim();
+  let   replies  = Array.isArray(content?.replies)
     ? content.replies.map((r) => String(r).trim()).filter(Boolean)
     : [];
 
-  if (!link) return { mainPost, replies };
-
   if (platform === 'threads') {
-    return { mainPost: `${mainPost}\n\n${link}`, replies };
+    // Link is appended to the main post → reserve room for it before clipping.
+    const reserve = link ? link.length + 2 : 0;
+    mainPost = clip(mainPost, cap - reserve);
+    if (link) mainPost = `${mainPost}\n\n${link}`;
+    replies = replies.map((r) => clip(r, cap));
+    return { mainPost, replies };
   }
+
   if (platform === 'x') {
-    // Link rides in the reply so the main tweet stays clean. Guarantee a reply exists.
-    const lead = replies[0] ? `${replies[0]}\n${link}` : link;
-    return { mainPost, replies: [lead, ...replies.slice(1)] };
+    // Main tweet stays clean (no link); link rides in the first reply.
+    mainPost = clip(mainPost, cap);
+    if (link) {
+      // X shortens URLs to ~23 chars via t.co; reserve a fixed slot regardless of length.
+      const leadCap = cap - 24;
+      const lead    = replies[0] ? `${clip(replies[0], leadCap)}\n${link}` : link;
+      replies = [lead, ...replies.slice(1).map((r) => clip(r, cap))];
+    } else {
+      replies = replies.map((r) => clip(r, cap));
+    }
+    return { mainPost, replies };
   }
+
   if (platform === 'bluesky') {
-    // Link goes on the last thread post; if there's no thread, the main post stays link-free.
-    if (replies.length === 0) return { mainPost, replies };
-    const last = `${replies[replies.length - 1]}\n${link}`;
-    return { mainPost, replies: [...replies.slice(0, -1), last] };
+    // Main post stays link-free; link goes on the last thread post.
+    mainPost = clip(mainPost, cap);
+    if (link && replies.length > 0) {
+      const lastIdx = replies.length - 1;
+      replies = replies.map((r, i) =>
+        i === lastIdx ? `${clip(r, cap - (link.length + 1))}\n${link}` : clip(r, cap)
+      );
+    } else {
+      replies = replies.map((r) => clip(r, cap));
+    }
+    return { mainPost, replies };
   }
-  return { mainPost, replies };
+
+  return { mainPost: clip(mainPost, cap), replies: replies.map((r) => clip(r, cap)) };
 }
 
 // ── Hero image scraping (og:image / twitter:image) ────────────────────────────
@@ -755,7 +804,7 @@ async function main() {
   // ── 3d. Write per-platform content for the winner ──────────────────────────
   let written;
   try {
-    written = await writePlatformPosts(original, platforms, Boolean(sourceLink));
+    written = await writePlatformPosts(original, platforms, sourceLink);
   } catch (err) {
     console.error('[Gemini] Fatal error during per-platform writing:', err.message);
     process.exit(1);
